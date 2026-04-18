@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import platform
 from pathlib import Path
 
 import numpy as np
@@ -15,22 +16,43 @@ class GGUFRunner:
         verbose: bool = False,
     ) -> None:
         self.model_path = Path(model_path)
-        self.generator = Llama(
+        self.n_ctx = n_ctx
+        self.n_batch = n_batch
+        self.verbose = verbose
+        self.backend = "cpu"
+        self.backend_reason = "default"
+
+        self.generator, self.embedder = self._load_models()
+
+    def _build_llama(self, *, embedding: bool, n_gpu_layers: int) -> Llama:
+        return Llama(
             model_path=str(self.model_path),
-            n_ctx=n_ctx,
-            n_batch=n_batch,
-            embedding=False,
+            n_ctx=self.n_ctx,
+            n_batch=self.n_batch,
+            embedding=embedding,
             logits_all=False,
-            verbose=verbose,
+            n_gpu_layers=n_gpu_layers,
+            verbose=self.verbose,
         )
-        self.embedder = Llama(
-            model_path=str(self.model_path),
-            n_ctx=n_ctx,
-            n_batch=n_batch,
-            embedding=True,
-            logits_all=False,
-            verbose=verbose,
-        )
+
+    def _load_models(self) -> tuple[Llama, Llama]:
+        prefer_metal = platform.system() == "Darwin"
+        if prefer_metal:
+            try:
+                generator = self._build_llama(embedding=False, n_gpu_layers=-1)
+                embedder = self._build_llama(embedding=True, n_gpu_layers=-1)
+                self.backend = "metal"
+                self.backend_reason = "loaded with n_gpu_layers=-1"
+                return generator, embedder
+            except Exception as exc:
+                self.backend = "cpu"
+                self.backend_reason = f"metal load failed: {exc}"
+
+        generator = self._build_llama(embedding=False, n_gpu_layers=0)
+        embedder = self._build_llama(embedding=True, n_gpu_layers=0)
+        if not prefer_metal:
+            self.backend_reason = "non-macOS host"
+        return generator, embedder
 
     def embed(self, text: str) -> np.ndarray:
         values = self.embedder.embed(text, normalize=True)

@@ -120,6 +120,7 @@ def benchmark(
         "This measures exact recent context plus retrieved old-window checkpoints.\n"
         "It does not validate exact residual-layer reconstruction with this backend."
     )
+    console.print(f"Backend: {runner.backend} ({runner.backend_reason})")
 
     for query_case in benchmark_case.queries:
         oracle_memory = build_oracle_memory(
