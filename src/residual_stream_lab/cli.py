@@ -66,6 +66,26 @@ def select_checkpoints(
     return "\n\n".join(memory_blocks), [checkpoint.window.index for checkpoint in selected]
 
 
+def build_oracle_memory(
+    benchmark: BenchmarkCase,
+    target_window_index: int,
+    recent_windows: int,
+    runner: GGUFRunner,
+) -> str:
+    windows = split_windows(benchmark.document, lines_per_window=benchmark.window_lines)
+    checkpoints = build_checkpoints(windows, runner.embed)
+    recent = windows[-recent_windows:] if recent_windows > 0 else []
+    recent_ids = {window.index for window in recent}
+    target_checkpoint = next(
+        checkpoint for checkpoint in checkpoints if checkpoint.window.index == target_window_index
+    )
+    recent_checkpoints = [checkpoint for checkpoint in checkpoints if checkpoint.window.index in recent_ids]
+
+    memory_blocks = [target_checkpoint.memory_packet()]
+    memory_blocks.extend(checkpoint.window.text for checkpoint in recent_checkpoints)
+    return "\n\n".join(memory_blocks)
+
+
 def exact_match(prediction: str, answer: str) -> bool:
     left = prediction.strip().lower().strip(".")
     right = answer.strip().lower().strip(".")
@@ -93,12 +113,26 @@ def benchmark(
 
     modes = ["full", "recent", "retrieval", "temporal"]
     rows: list[dict[str, object]] = []
+    oracle_correct = 0
 
     console.print(
         "[bold]Residual stream sidecar benchmark[/bold]\n"
         "This measures exact recent context plus retrieved old-window checkpoints.\n"
         "It does not validate exact residual-layer reconstruction with this backend."
     )
+
+    for query_case in benchmark_case.queries:
+        oracle_memory = build_oracle_memory(
+            benchmark=benchmark_case,
+            target_window_index=query_case.window_index,
+            recent_windows=recent_windows,
+            runner=runner,
+        )
+        oracle_prediction = runner.answer_question(
+            memory=oracle_memory,
+            question=query_case.question,
+        )
+        oracle_correct += int(exact_match(oracle_prediction, query_case.answer))
 
     for mode in modes:
         correct = 0
@@ -148,6 +182,16 @@ def benchmark(
         row["accuracy"] for row in rows if row["mode"] == "retrieval"
     )
     console.print(f"Temporal rerank lift over semantic retrieval: {temporal_delta:+.2f}")
+    oracle_accuracy = oracle_correct / len(benchmark_case.queries)
+    console.print(f"Oracle-correct memory accuracy: {oracle_accuracy:.2f}")
+    retrieval_gap = oracle_accuracy - next(
+        row["accuracy"] for row in rows if row["mode"] == "retrieval"
+    )
+    temporal_gap = oracle_accuracy - next(
+        row["accuracy"] for row in rows if row["mode"] == "temporal"
+    )
+    console.print(f"Retrieval-to-oracle gap: {retrieval_gap:+.2f}")
+    console.print(f"Temporal-to-oracle gap: {temporal_gap:+.2f}")
 
 
 if __name__ == "__main__":

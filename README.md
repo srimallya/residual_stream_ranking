@@ -30,6 +30,11 @@ Each checkpoint stores:
 
 Retrieval uses embedding similarity between the question and each checkpoint. Temporal mode adds a lightweight reranker over checkpoint links derived from shared terms and temporal proximity.
 
+The benchmark also reports two diagnostic metrics:
+
+- target hit rate: whether the target historical window was selected at all
+- oracle-correct memory accuracy: answer quality when the correct old checkpoint is injected directly
+
 ## Project Layout
 
 ```text
