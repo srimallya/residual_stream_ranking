@@ -6,6 +6,8 @@ from typing import Iterable
 
 import numpy as np
 
+from residual_stream_lab.trace import NullTraceProvider, TraceCheckpointPayload, TraceProvider
+
 
 STOPWORDS = {
     "the", "and", "with", "from", "into", "that", "this", "what", "when", "where",
@@ -30,16 +32,22 @@ class Window:
 
 
 @dataclass(slots=True)
-class Checkpoint:
-    window: Window
+class SemanticCheckpointPayload:
     window_embedding: np.ndarray
     boundary_embedding: np.ndarray
     terms: frozenset[str]
 
+
+@dataclass(slots=True)
+class Checkpoint:
+    window: Window
+    semantic: SemanticCheckpointPayload
+    trace: TraceCheckpointPayload
+
     def score(self, query_embedding: np.ndarray) -> float:
         return max(
-            cosine_similarity(query_embedding, self.window_embedding),
-            cosine_similarity(query_embedding, self.boundary_embedding),
+            cosine_similarity(query_embedding, self.semantic.window_embedding),
+            cosine_similarity(query_embedding, self.semantic.boundary_embedding),
         )
 
     def memory_packet(self) -> str:
@@ -80,15 +88,25 @@ def extract_terms(text: str) -> frozenset[str]:
 def build_checkpoints(
     windows: Iterable[Window],
     embed_text: callable,
+    trace_provider: TraceProvider | None = None,
+    layer_cutoff_b: int | None = None,
 ) -> list[Checkpoint]:
+    provider = trace_provider or NullTraceProvider()
     checkpoints: list[Checkpoint] = []
     for window in windows:
         checkpoints.append(
             Checkpoint(
                 window=window,
-                window_embedding=embed_text(window.text),
-                boundary_embedding=embed_text(window.boundary_text),
-                terms=extract_terms(window.text),
+                semantic=SemanticCheckpointPayload(
+                    window_embedding=embed_text(window.text),
+                    boundary_embedding=embed_text(window.boundary_text),
+                    terms=extract_terms(window.text),
+                ),
+                trace=provider.capture_boundary_residual(
+                    boundary_token_index=window.index,
+                    layer_cutoff_b=layer_cutoff_b,
+                    window_text=window.text,
+                ),
             )
         )
     return checkpoints

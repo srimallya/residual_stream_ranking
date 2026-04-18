@@ -23,12 +23,21 @@ The CLI command `residual-lab benchmark` runs a synthetic long-context recall be
 
 Each checkpoint stores:
 
-- the original window text
-- boundary text
-- a window embedding
-- a boundary embedding
+- window text and boundary text
+- a semantic payload used today for retrieval
+  - window embedding
+  - boundary embedding
+  - extracted terms
+- a trace payload reserved for future exact-reconstruction experiments
+  - boundary residual at a layer cutoff
+  - selected late-layer deltas
 
 Retrieval uses embedding similarity between the question and each checkpoint. Temporal mode adds a lightweight reranker over checkpoint links derived from shared terms and temporal proximity.
+
+Today only the semantic payload is populated. The trace payload exists to make the separation explicit:
+
+- semantic payload answers: "which past region should I retrieve?"
+- trace payload answers: "if the backend exposes the right internals, what exact state pieces could I reconstruct?"
 
 The benchmark also reports two diagnostic metrics:
 
@@ -40,10 +49,13 @@ The benchmark also reports two diagnostic metrics:
 ```text
 src/residual_stream_lab/
   checkpointing.py   checkpoint building and retrieval
+  trace.py           trace payload interface and reconstruction helpers
   temporal.py        temporal reranking logic
   synthetic.py       synthetic benchmark generation
   llm.py             local GGUF model runner
   cli.py             Typer CLI entrypoint
+tests/
+  test_trace.py      trace reconstruction contract tests
 models/
   Qwen3.5-2B-Q8_0.gguf
 ```
@@ -109,7 +121,7 @@ Expected behavior for this prototype:
 Likely next steps if you want to validate the stronger residual-stream idea:
 
 1. Swap to a backend that exposes layerwise residual or hidden-state traces.
-2. Replace proxy checkpoint encoding with exact residual-state checkpoint objects.
+2. Populate the trace payload with exact residual-state checkpoint objects.
 3. Add evaluation for reconstruction fidelity alongside answer quality.
 4. Benchmark on real long-context tasks, not only synthetic recall prompts.
 

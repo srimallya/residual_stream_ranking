@@ -23,7 +23,7 @@ def build_temporal_adjacency(checkpoints: list[Checkpoint]) -> np.ndarray:
         for j, right in enumerate(checkpoints):
             if i == j:
                 continue
-            lexical = overlap_weight(left.terms, right.terms)
+            lexical = overlap_weight(left.semantic.terms, right.semantic.terms)
             if lexical == 0.0:
                 continue
             temporal = 1.0 / (abs(left.window.index - right.window.index) + 1.0)
@@ -88,13 +88,13 @@ def rerank_checkpoints(
 
     adjacency = build_temporal_adjacency(candidates)
     query_terms = extract_terms(query_text)
-    recent_terms = frozenset().union(*(checkpoint.terms for checkpoint in recent_windows))
+    recent_terms = frozenset().union(*(checkpoint.semantic.terms for checkpoint in recent_windows))
     query_seed = np.asarray(
-        [overlap_weight(candidate.terms, query_terms) for candidate in candidates],
+        [overlap_weight(candidate.semantic.terms, query_terms) for candidate in candidates],
         dtype=np.float32,
     )
     recent_seed = np.asarray(
-        [overlap_weight(candidate.terms, recent_terms) for candidate in candidates],
+        [overlap_weight(candidate.semantic.terms, recent_terms) for candidate in candidates],
         dtype=np.float32,
     )
 

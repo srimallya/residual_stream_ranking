@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 import typer
 from rich.console import Console
 from rich.table import Table
@@ -86,6 +88,25 @@ def build_oracle_memory(
     return "\n\n".join(memory_blocks)
 
 
+def extract_atomic_answer(prediction: str, valid_answers: set[str]) -> str | None:
+    lowered = prediction.strip().lower()
+    if not lowered:
+        return None
+
+    lines = [line.strip(" -*`\t") for line in lowered.splitlines() if line.strip()]
+    for line in reversed(lines):
+        if line in valid_answers:
+            return line
+        for answer in valid_answers:
+            if re.search(rf"\b{re.escape(answer)}\b", line):
+                return answer
+
+    for answer in valid_answers:
+        if re.search(rf"\b{re.escape(answer)}\b", lowered):
+            return answer
+    return None
+
+
 def exact_match(prediction: str, answer: str) -> bool:
     left = prediction.strip().lower().strip(".")
     right = answer.strip().lower().strip(".")
@@ -110,10 +131,12 @@ def benchmark(
         seed=seed,
     )
     runner = GGUFRunner(model_path=model_path, n_ctx=n_ctx)
+    valid_answers = {query.answer.lower() for query in benchmark_case.queries}
 
     modes = ["full", "recent", "retrieval", "temporal"]
     rows: list[dict[str, object]] = []
     oracle_correct = 0
+    oracle_parse_success = 0
 
     console.print(
         "[bold]Residual stream sidecar benchmark[/bold]\n"
@@ -133,11 +156,14 @@ def benchmark(
             memory=oracle_memory,
             question=query_case.question,
         )
-        oracle_correct += int(exact_match(oracle_prediction, query_case.answer))
+        parsed = extract_atomic_answer(oracle_prediction, valid_answers)
+        oracle_parse_success += int(parsed is not None)
+        oracle_correct += int(parsed == query_case.answer.lower())
 
     for mode in modes:
         correct = 0
         hits = 0
+        parse_success = 0
         predictions: list[str] = []
         for query_case in benchmark_case.queries:
             memory, selected_ids = select_checkpoints(
@@ -149,14 +175,17 @@ def benchmark(
                 runner=runner,
             )
             prediction = runner.answer_question(memory=memory, question=query_case.question)
-            predictions.append(prediction)
-            correct += int(exact_match(prediction, query_case.answer))
+            parsed = extract_atomic_answer(prediction, valid_answers)
+            predictions.append(parsed or prediction)
+            parse_success += int(parsed is not None)
+            correct += int(parsed == query_case.answer.lower())
             hits += int(query_case.window_index in selected_ids)
         rows.append(
             {
                 "mode": mode,
                 "accuracy": correct / len(benchmark_case.queries),
                 "hit_rate": hits / len(benchmark_case.queries),
+                "parse_rate": parse_success / len(benchmark_case.queries),
                 "sample_prediction": predictions[0] if predictions else "",
             }
         )
@@ -165,12 +194,14 @@ def benchmark(
     table.add_column("Mode")
     table.add_column("Accuracy")
     table.add_column("Target Hit Rate")
+    table.add_column("Parse Rate")
     table.add_column("Sample Prediction")
     for row in rows:
         table.add_row(
             str(row["mode"]),
             f"{row['accuracy']:.2f}",
             f"{row['hit_rate']:.2f}",
+            f"{row['parse_rate']:.2f}",
             str(row["sample_prediction"]),
         )
     console.print(table)
@@ -184,7 +215,9 @@ def benchmark(
     )
     console.print(f"Temporal rerank lift over semantic retrieval: {temporal_delta:+.2f}")
     oracle_accuracy = oracle_correct / len(benchmark_case.queries)
+    oracle_parse_rate = oracle_parse_success / len(benchmark_case.queries)
     console.print(f"Oracle-correct memory accuracy: {oracle_accuracy:.2f}")
+    console.print(f"Oracle parse success rate: {oracle_parse_rate:.2f}")
     retrieval_gap = oracle_accuracy - next(
         row["accuracy"] for row in rows if row["mode"] == "retrieval"
     )
@@ -193,6 +226,16 @@ def benchmark(
     )
     console.print(f"Retrieval-to-oracle gap: {retrieval_gap:+.2f}")
     console.print(f"Temporal-to-oracle gap: {temporal_gap:+.2f}")
+
+    full_accuracy = next(row["accuracy"] for row in rows if row["mode"] == "full")
+    full_parse_rate = next(row["parse_rate"] for row in rows if row["mode"] == "full")
+    comparison_valid = full_accuracy == 1.0 and oracle_accuracy == 1.0 and full_parse_rate == 1.0 and oracle_parse_rate == 1.0
+    console.print(f"Memory comparison valid: {'yes' if comparison_valid else 'no'}")
+    if not comparison_valid:
+        console.print(
+            "Memory mode deltas are not interpretable because the model failed the full-context "
+            "or oracle answer contract."
+        )
 
 
 if __name__ == "__main__":
