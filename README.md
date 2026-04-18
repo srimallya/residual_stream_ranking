@@ -51,6 +51,7 @@ src/residual_stream_lab/
   checkpointing.py   checkpoint building and retrieval
   trace.py           trace payload interface and reconstruction helpers
   temporal.py        temporal reranking logic
+  apollo.py          corpus-backed Apollo benchmark case generation
   synthetic.py       synthetic benchmark generation
   llm.py             local GGUF model runner
   cli.py             Typer CLI entrypoint

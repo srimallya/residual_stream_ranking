@@ -61,6 +61,9 @@ class GGUFRunner:
         vector = values[0] if values and isinstance(values[0], list) else values
         return np.asarray(vector, dtype=np.float32)
 
+    def token_count(self, text: str) -> int:
+        return len(self.generator.tokenize(text.encode("utf-8"), add_bos=False))
+
     def _normalize_answer(self, text: str) -> str:
         normalized = text.strip()
         if "</think>" in normalized:
