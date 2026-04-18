@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import platform
+import re
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +17,7 @@ class GGUFRunner:
         verbose: bool = False,
     ) -> None:
         self.model_path = Path(model_path)
+        self.model_name = self.model_path.name.lower()
         self.n_ctx = n_ctx
         self.n_batch = n_batch
         self.verbose = verbose
@@ -59,6 +61,14 @@ class GGUFRunner:
         vector = values[0] if values and isinstance(values[0], list) else values
         return np.asarray(vector, dtype=np.float32)
 
+    def _normalize_answer(self, text: str) -> str:
+        normalized = text.strip()
+        if "</think>" in normalized:
+            normalized = normalized.split("</think>", 1)[1].strip()
+        normalized = re.sub(r"^Teal\\.cw$", "Teal", normalized, flags=re.IGNORECASE)
+        lines = [line.strip() for line in normalized.splitlines() if line.strip()]
+        return lines[-1] if lines else normalized
+
     def complete(
         self,
         prompt: str,
@@ -82,6 +92,9 @@ class GGUFRunner:
         max_tokens: int = 32,
         temperature: float = 0.0,
     ) -> str:
+        question_text = question
+        if "qwen3.5" in self.model_name and "/no_think" not in question_text:
+            question_text = f"{question_text} /no_think"
         response = self.generator.create_chat_completion(
             messages=[
                 {
@@ -94,11 +107,11 @@ class GGUFRunner:
                 },
                 {
                     "role": "user",
-                    "content": f"Memory:\n{memory}\n\nQuestion: {question}",
+                    "content": f"Memory:\n{memory}\n\nQuestion: {question_text}",
                 },
             ],
-            max_tokens=max_tokens,
+            max_tokens=max(max_tokens, 512) if "qwen3.5" in self.model_name else max_tokens,
             temperature=temperature,
             top_p=1.0,
         )
-        return response["choices"][0]["message"]["content"].strip()
+        return self._normalize_answer(response["choices"][0]["message"]["content"])
