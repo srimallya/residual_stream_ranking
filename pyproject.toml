@@ -1,0 +1,30 @@
+[project]
+name = "residual-stream-lab"
+version = "0.1.0"
+description = "Prototype long-context experiments using exact recent context plus retrieved checkpoint memory."
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.10"
+dependencies = [
+  "llama-cpp-python>=0.3.20",
+  "numpy>=2.2.0",
+  "pydantic>=2.11.0",
+  "rich>=15.0.0",
+  "typer>=0.24.0",
+]
+
+[project.urls]
+Repository = "https://github.com/srimallya/residual_stream_ranking"
+
+[project.scripts]
+residual-lab = "residual_stream_lab.cli:app"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
