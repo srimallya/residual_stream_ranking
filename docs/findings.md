@@ -1048,3 +1048,49 @@ Updated bridge read:
 - the bridge hierarchy survives the larger, more balanced Apollo slice
 - `token@10/fp16` remains effectively in the safe group, with only slight ranking softness
 - `token@10/int8` continues to be the first replay object that fails under routed pressure, and it now does so in both the medium and far buckets rather than only in a single stressed corner
+
+Harder fp16 stress cut:
+
+- the bridge was then stressed by widening the Apollo slice again and doubling the replay horizon to `20` steps:
+  - cases: `24`
+  - routed top-1 hits: `18`
+  - top-1 hit rate: `0.75`
+  - top-k hit rate: `1.00`
+- this was the right pressure test for the practical compact candidate because it gave iterative drift more room to show up without changing the router or the replay object panel
+
+Hit-conditioned replay summary on the harder cut:
+
+- `text@window`:
+  - token agreement: `1.00`
+  - top-5 full rate: `1.00`
+- `token@10`:
+  - token agreement: `1.00`
+  - top-5 full rate: `1.00`
+- `token@10/fp16`:
+  - token agreement: `1.00`
+  - top-5 full rate: `1.00`
+  - divergence rate: `0.00`
+- `token@10/int8`:
+  - token agreement: `0.88`
+  - top-5 full rate: `0.79`
+  - divergence rate: `0.17`
+- full late band `delta_depth=4`:
+  - token agreement: `1.00`
+  - top-5 full rate: `1.00`
+
+Bucketed view on the harder cut:
+
+- near hits:
+  - `fp16` remained clean except for negligible ranking softness
+  - `int8` degraded to token agreement `0.93`, top-5 full rate `0.82`, divergence rate `0.17`
+- medium hits:
+  - `fp16` stayed clean
+  - `int8` degraded to token agreement `0.83`, top-5 full rate `0.78`, divergence rate `0.20`
+- far hits:
+  - `fp16` stayed clean
+  - `int8` degraded to token agreement `0.86`, top-5 full rate `0.78`, divergence rate `0.14`
+
+Updated bridge conclusion:
+
+- `token@10/fp16` has now survived the routed bridge under both wider slices and a doubled continuation horizon, and remains behaviorally welded to the exact/text/full-band group on the tested Apollo envelope
+- `token@10/int8` remains the first repeatedly demonstrated lossy failure boundary and continues to degrade across all routed difficulty buckets when the bridge is stressed harder
