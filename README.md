@@ -290,14 +290,14 @@ The current benchmark evidence supports this decomposition:
 - the memory ledger now supports a conservative reversible lifecycle step: `warm -> cold` can be applied, while `archived` and `pruned` remain reporting-only
 - the current `cold` policy is intentionally narrow and tuned around replay-quality failures rather than generic retrieval participation
 - archive eligibility now depends on repeated weak evidence across persisted runs, but archive action itself is still disabled
-- recovery suggestions now exist in reporting, but automatic `cold -> warm` promotion is still disabled until strong resurgence has been validated across repeated runs
+- recovery suggestions now exist in reporting, and the bridge has already surfaced a real `cold -> warm` candidate under far-bucket resurgence; automatic `cold -> warm` promotion is still disabled until that pattern is validated over more repeated runs
 - the bundled GGUF models are local dependencies and are not intended to be committed to git
 
 ## Roadmap
 
 Likely next steps from the current state:
 
-1. Validate real `cold -> warm` recovery candidates across persisted bridge runs before enabling any automatic warming.
+1. Validate repeated `cold -> warm` recovery candidates across persisted bridge runs before enabling any automatic warming.
 2. Keep `archived` and `pruned` reporting-only until repeated-weakness archive suggestions are validated over more persisted bridge runs.
 3. Stress `token@10/fp16` on harder routed slices before trying smarter lossy replay-token codecs.
 4. Run context-budget ablations such as `4096` vs `8192`.

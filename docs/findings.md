@@ -1333,3 +1333,29 @@ Current read:
   - repeated weakness can become archive-eligible in reporting
   - strong resurgence can become warm-eligible in reporting
 - but only the reversible `warm -> cold` step is still allowed to mutate state
+
+First real resurgence case:
+
+- drove a persisted bridge run that finally produced a non-empty recovery table
+- replay behavior stayed unchanged again:
+  - `text@window`, exact replay token, full late band, and `fp16` remained clean
+  - `int8` remained the weak family overall
+- but one previously cold `token@10/int8` object showed a genuine comeback:
+  - current tier: `cold`
+  - suggested tier: `warm`
+  - token agreement: `1.00`
+  - top-5 full rate: `1.00`
+  - bucket: `far`
+  - `consecutive_strong_runs = 1`
+  - `resurgence_count = 1`
+
+Interpretation:
+
+- the recovery signal is now doing real work instead of just existing on paper
+- it surfaced a cold object only after a strong recovery under meaningful pressure
+- no false warm-ups appeared for the safe group or for weak-but-not-recovered objects
+- automatic warming still remains disabled, but the reporting layer has now seen the full lifecycle shape:
+  - cooling
+  - repeated weakness
+  - archive eligibility
+  - real resurgence
