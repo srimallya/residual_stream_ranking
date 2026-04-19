@@ -46,4 +46,14 @@ The first live product slice is now in place:
 - `/v1/chat/respond` handles a real persisted chat round-trip
 - `/v1/conversations/{conversationId}/graph` hydrates the left-rail graph and visible thread
 
-The reply path is still deterministic on purpose. The next step is to replace that deterministic assistant response with real Gemma generation while keeping the same persistence and IPC contract intact.
+The response path is now Gemma-backed:
+
+- the sidecar loads Gemma once at startup
+- model residency and load timing are surfaced through `/v1/health`
+- `/v1/chat/respond` now:
+  - assembles the current thread into a chat prompt
+  - runs local Gemma generation
+  - persists the resulting assistant turn
+  - returns timing breakdowns for prompt assembly, generation, persistence, and total round-trip
+
+The next step is bounded active-window assembly and then replay-object rollover, not a new contract rewrite.

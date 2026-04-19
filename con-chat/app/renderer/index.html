@@ -46,6 +46,10 @@
             <h2>Bounded live state, routed memory</h2>
           </div>
           <div class="status-cluster">
+            <div class="status-pill status-pill-preview" id="preview-pill" hidden>
+              <span class="dot dot-amber"></span>
+              <span>Browser preview</span>
+            </div>
             <div class="status-pill">
               <span class="dot dot-green"></span>
               <span id="sidecar-status">Sidecar contract</span>
@@ -100,11 +104,20 @@
               </ul>
             </section>
             <section class="inspector-card">
+              <div class="inspector-title">Latest Round Trip</div>
+              <dl class="inspector-grid inspector-grid-stack">
+                <div><dt>Total</dt><dd id="timing-total">n/a</dd></div>
+                <div><dt>Generation</dt><dd id="timing-generation">n/a</dd></div>
+                <div><dt>Prompt</dt><dd id="timing-prompt">n/a</dd></div>
+                <div><dt>Persist</dt><dd id="timing-persist">n/a</dd></div>
+              </dl>
+            </section>
+            <section class="inspector-card">
               <div class="inspector-title">Next Product Slice</div>
               <ul class="bullets">
-                <li>Launch local Python sidecar from Electron main.</li>
-                <li>Persist turns, graph edges, and memory objects in SQLite.</li>
-                <li>Seal older regions at ~32k active tokens.</li>
+                <li>Assemble a bounded active window from persisted turns.</li>
+                <li>Seal older stable ranges into replay objects near 32k tokens.</li>
+                <li>Reinject recalled memory into live Gemma generation.</li>
               </ul>
             </section>
           </aside>

@@ -44,7 +44,8 @@ body {
   background: linear-gradient(180deg, rgba(17, 23, 34, 0.95), rgba(13, 18, 27, 0.98));
   border-right: 1px solid var(--line);
   padding: 24px 18px;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
   transition: width 180ms ease, padding 180ms ease;
 }
 
@@ -197,6 +198,10 @@ h2 {
   background: var(--accent);
 }
 
+.dot-amber {
+  background: var(--accent-2);
+}
+
 .chat-layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 320px;
@@ -326,6 +331,10 @@ h2 {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
+.inspector-grid-stack {
+  grid-template-columns: 1fr;
+}
+
 .inspector-grid dd {
   margin: 0;
   font-weight: 700;
@@ -356,12 +365,14 @@ h2 {
   line-height: 1.45;
 }
 
-@media (max-width: 1280px) {
-  .app-shell {
-    grid-template-columns: 92px 1fr;
-  }
-
+@media (max-width: 1360px) {
   .chat-layout {
     grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 1100px) {
+  .app-shell {
+    grid-template-columns: 92px 1fr;
   }
 }

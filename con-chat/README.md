@@ -69,5 +69,6 @@ The scaffold is intentionally thin but already executable as a product boundary:
 - the renderer bootstraps from that persisted state instead of hardcoded demo messages
 - one real end-to-end chat turn now flows:
   - renderer -> Electron main -> Python sidecar -> SQLite -> Electron main -> renderer
+- the sidecar now loads Gemma once, keeps it resident, and serves real local generation instead of a deterministic stub
 
-The next slice is replacing the deterministic sidecar reply with real Gemma generation and then letting older regions compact into replay objects at the active-window boundary.
+The next slice is bounded active-window assembly: keep Gemma generation on the current thread, then start sealing older stable ranges into replay objects at the `32k` boundary.

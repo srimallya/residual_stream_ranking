@@ -109,6 +109,9 @@ components:
             type: object
         selectedMemory:
           type: object
+        timings:
+          type: object
+          description: Runtime timing breakdown for prompt assembly, generation, persistence, and total round-trip.
     CompactRequest:
       type: object
       required:

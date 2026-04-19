@@ -5,11 +5,16 @@ import json
 import os
 import sqlite3
 import sys
+import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 PORT = int(os.environ.get("CON_CHAT_PORT", "4318"))
@@ -19,6 +24,22 @@ MODEL_DEVICE = os.environ.get("CON_CHAT_MODEL_DEVICE", "mps")
 ORCHESTRATION_DEVICE = os.environ.get("CON_CHAT_ORCHESTRATION_DEVICE", "cpu")
 DEFAULT_CONVERSATION_ID = "demo-thread"
 MAX_TOKENS = 32768
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def resolve_model_path(model_name: str) -> str:
+    explicit = Path(model_name)
+    if explicit.exists():
+        return str(explicit.resolve())
+
+    candidates = [
+        REPO_ROOT / "models" / model_name,
+        REPO_ROOT / "models" / "google--gemma-4-E2B-it",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate.resolve())
+    return model_name
 
 
 def now_iso() -> str:
@@ -38,9 +59,129 @@ class GraphNode:
     y: int
 
 
+class GemmaRuntime:
+    def __init__(self, model_name: str, preferred_device: str) -> None:
+        self.model_name = resolve_model_path(model_name)
+        self.preferred_device = preferred_device
+        self.actual_device = "cpu"
+        self.dtype = torch.float32
+        self.tokenizer = None
+        self.model = None
+        self.lock = threading.Lock()
+        self.load_seconds = 0.0
+        self.ready = False
+        self.error = None
+        self._load()
+
+    def _resolve_device(self) -> tuple[str, torch.dtype]:
+        if self.preferred_device == "mps" and torch.backends.mps.is_available():
+            return "mps", torch.float16
+        return "cpu", torch.float32
+
+    def _load(self) -> None:
+        start = time.perf_counter()
+        try:
+            device, dtype = self._resolve_device()
+            tokenizer = AutoTokenizer.from_pretrained(self.model_name, local_files_only=True)
+            model = AutoModelForCausalLM.from_pretrained(
+                self.model_name,
+                local_files_only=True,
+                torch_dtype=dtype,
+            )
+            model.to(device)
+            model.eval()
+            self.actual_device = device
+            self.dtype = dtype
+            self.tokenizer = tokenizer
+            self.model = model
+            self.ready = True
+        except Exception as exc:  # pragma: no cover - startup failure path
+            self.ready = False
+            self.error = repr(exc)
+        finally:
+            self.load_seconds = time.perf_counter() - start
+
+    def count_tokens(self, text: str) -> int:
+        if not self.tokenizer:
+            return token_estimate(text)
+        tokens = self.tokenizer(text, add_special_tokens=False, return_attention_mask=False)
+        return len(tokens["input_ids"])
+
+    def generate_reply(self, turns: list[sqlite3.Row]) -> tuple[str, dict]:
+        if not self.ready or not self.model or not self.tokenizer:
+            raise RuntimeError(f"model_not_ready:{self.error}")
+
+        prompt_start = time.perf_counter()
+        prompt = self._format_prompt(turns)
+        model_inputs = self.tokenizer(prompt, return_tensors="pt").input_ids
+        prompt_seconds = time.perf_counter() - prompt_start
+
+        generation_start = time.perf_counter()
+        with self.lock, torch.inference_mode():
+            inputs = model_inputs.to(self.actual_device)
+            outputs = self.model.generate(
+                inputs,
+                max_new_tokens=96,
+                do_sample=False,
+                repetition_penalty=1.08,
+                pad_token_id=self.tokenizer.eos_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+            )
+        generation_seconds = time.perf_counter() - generation_start
+
+        prompt_tokens = int(model_inputs.shape[-1])
+        generated_ids = outputs[0, prompt_tokens:]
+        assistant_text = self._clean_response(
+            self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+        )
+        completion_tokens = int(generated_ids.shape[-1])
+
+        if not assistant_text:
+            assistant_text = "I’m ready, but the model returned an empty completion."
+
+        return assistant_text, {
+            "promptAssemblySeconds": round(prompt_seconds, 4),
+            "generationSeconds": round(generation_seconds, 4),
+            "totalModelSeconds": round(prompt_seconds + generation_seconds, 4),
+            "promptTokens": prompt_tokens,
+            "completionTokens": completion_tokens,
+            "modelDevice": self.actual_device,
+        }
+
+    def _format_prompt(self, turns: list[sqlite3.Row]) -> str:
+        chunks: list[str] = [
+            "You are con-chat, a local assistant with bounded active context and routed replay memory.",
+            "Answer naturally and concisely.",
+            "",
+        ]
+        for row in turns:
+            role = row["role"]
+            text = row["text"]
+            if role == "system":
+                chunks.append(f"System: {text}")
+            elif role == "user":
+                chunks.append(f"User: {text}")
+            elif role == "assistant":
+                chunks.append(f"Assistant: {text}")
+        chunks.append("Assistant:")
+        return "\n".join(chunks)
+
+    def _clean_response(self, text: str) -> str:
+        cleaned = text.strip()
+        if "User:" in cleaned:
+            cleaned = cleaned.split("User:", 1)[0].strip()
+        if "System:" in cleaned:
+            cleaned = cleaned.split("System:", 1)[0].strip()
+        while cleaned.startswith("Assistant:"):
+            cleaned = cleaned[len("Assistant:") :].strip()
+        cleaned = cleaned.replace("\nAssistant:", "\n").strip()
+        return cleaned
+
+
 class Store:
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, runtime: GemmaRuntime) -> None:
         self.db_path = db_path
+        self.runtime = runtime
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
         self._ensure_seed()
@@ -159,7 +300,7 @@ class Store:
                     insert into turns (id, conversation_id, role, text, token_count, created_at)
                     values (?, ?, ?, ?, ?, ?)
                     """,
-                    (turn_id, DEFAULT_CONVERSATION_ID, role, text, token_estimate(text), created_at),
+                    (turn_id, DEFAULT_CONVERSATION_ID, role, text, self.runtime.count_tokens(text), created_at),
                 )
 
             conn.execute(
@@ -273,12 +414,25 @@ class Store:
 
     def append_turns(self, conversation_id: str, user_text: str) -> dict:
         created_at = now_iso()
-        user_id = f"turn-{int(datetime.now().timestamp() * 1000)}-u"
-        assistant_id = f"turn-{int(datetime.now().timestamp() * 1000)}-a"
-        user_tokens = token_estimate(user_text)
-        assistant_text = self._assistant_reply(user_text)
-        assistant_tokens = token_estimate(assistant_text)
+        unique = str(int(datetime.now().timestamp() * 1000))
+        user_id = f"turn-{unique}-u"
+        assistant_id = f"turn-{unique}-a"
+        user_tokens = self.runtime.count_tokens(user_text)
 
+        with self.connect() as conn:
+            prior_turns = conn.execute(
+                "select * from turns where conversation_id = ? order by created_at asc",
+                (conversation_id,),
+            ).fetchall()
+        synthetic_user_row = {
+            "id": user_id,
+            "role": "user",
+            "text": user_text,
+        }
+        assistant_text, timings = self.runtime.generate_reply([*prior_turns, synthetic_user_row])
+        assistant_tokens = max(self.runtime.count_tokens(assistant_text), timings["completionTokens"])
+
+        persistence_start = time.perf_counter()
         with self.connect() as conn:
             conversation = conn.execute(
                 "select * from conversations where id = ?",
@@ -374,13 +528,25 @@ class Store:
                     conversation_id,
                     last_memory["id"] if last_memory else None,
                     "chat-round",
-                    json.dumps({"userTurnId": user_id, "assistantTurnId": assistant_id}),
+                    json.dumps(
+                        {
+                            "userTurnId": user_id,
+                            "assistantTurnId": assistant_id,
+                            "timings": timings,
+                        }
+                    ),
                     created_at,
                 ),
             )
+        persistence_seconds = time.perf_counter() - persistence_start
 
         snapshot = self.conversation_snapshot(conversation_id)
         snapshot["assistantText"] = assistant_text
+        snapshot["timings"] = {
+            **timings,
+            "persistenceSeconds": round(persistence_seconds, 4),
+            "totalRoundTripSeconds": round(timings["totalModelSeconds"] + persistence_seconds, 4),
+        }
         return snapshot
 
     def _graph_nodes(self, turns: list[sqlite3.Row], memory: sqlite3.Row | None) -> list[GraphNode]:
@@ -410,14 +576,9 @@ class Store:
             "lastUsedLabel": "recently",
         }
 
-    def _assistant_reply(self, user_text: str) -> str:
-        return (
-            "The local sidecar received your turn, stored it in SQLite, and kept the bounded-thread model intact. "
-            "The next slice will replace this deterministic reply with real Gemma generation and replay-object rollout."
-        )
 
-
-STORE = Store(DB_PATH)
+RUNTIME = GemmaRuntime(MODEL_NAME, MODEL_DEVICE)
+STORE = Store(DB_PATH, RUNTIME)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -426,14 +587,17 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         if parsed.path == "/v1/health":
+            status = "ready" if RUNTIME.ready else "error"
             self._send_json(
-                200,
+                200 if RUNTIME.ready else 503,
                 {
-                    "status": "ready",
+                    "status": status,
                     "model": MODEL_NAME,
-                    "modelDevice": MODEL_DEVICE,
+                    "modelDevice": RUNTIME.actual_device,
                     "orchestrationDevice": ORCHESTRATION_DEVICE,
                     "dbPath": str(DB_PATH),
+                    "modelLoadSeconds": round(RUNTIME.load_seconds, 4),
+                    "error": RUNTIME.error,
                 },
             )
             return
@@ -453,7 +617,10 @@ class Handler(BaseHTTPRequestHandler):
             if not user_text:
                 self._send_json(400, {"error": "empty_message"})
                 return
-            self._send_json(200, STORE.append_turns(conversation_id, user_text))
+            try:
+                self._send_json(200, STORE.append_turns(conversation_id, user_text))
+            except Exception as exc:  # pragma: no cover - runtime failure path
+                self._send_json(500, {"error": "generation_failed", "detail": repr(exc)})
             return
 
         self._send_json(404, {"error": "not_found"})

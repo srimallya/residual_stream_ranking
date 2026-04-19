@@ -52,6 +52,7 @@ Current implemented slice:
   - ledger events
   - settings
 - real end-to-end chat round-trip through Electron -> sidecar -> SQLite -> renderer
+- resident Gemma generation inside the sidecar, with health and timing surfaced separately from orchestration
 
 ## Active Conversation Policy
 
