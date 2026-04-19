@@ -215,13 +215,24 @@ Verify offline hidden-state reconstruction with a Hugging Face backend:
   --delta-layers 7,8,9,10,11
 ```
 
-Verify phase 2A resumed execution for GPT-2-class decoder models:
+Verify phase 2A resumed execution for a repo-local HF model:
 
 ```bash
 .venv/bin/residual-lab trace-resume-verify \
   --model-name-or-path gpt2 \
   --prompt "The capital of France is" \
   --boundary-layer 6
+```
+
+Gemma 4 2B is also supported on the HF text path:
+
+```bash
+.venv/bin/residual-lab trace-resume-verify \
+  --model-name-or-path models/google--gemma-4-E2B-it \
+  --prompt "The capital of France is" \
+  --boundary-layer 30 \
+  --device cpu \
+  --dtype float16
 ```
 
 Probe compact replay objects against the exact replay baseline:
@@ -235,7 +246,7 @@ Probe compact replay objects against the exact replay baseline:
   --delta-depths 0,1,2,4
 ```
 
-`trace-verify` captures observed layer outputs for one token, stores the boundary state plus incremental deltas, and checks offline reconstruction. `trace-resume-verify` takes the next narrow step: inject a captured full-sequence boundary hidden state at one layer, run the remaining layers, and compare resumed logits against the direct pass for one target token.
+`trace-verify` captures observed layer outputs for one token, stores the boundary state plus incremental deltas, and checks offline reconstruction. `trace-resume-verify` takes the next narrow step: inject a captured full-sequence boundary hidden state at one layer, run the remaining layers, and compare resumed logits against the direct pass for one target token. The current repo-local HF verification path now covers both GPT-2-class decoder models and Gemma 4 text-only prompts.
 `trace-compact-sweep` asks a different question: if exact prefix states are kept, how many late-layer deltas for the target token must remain in the replay object before next-token behavior lines up with the exact replay baseline again?
 
 The compact replay branch now has a dedicated frontier table in [docs/compact_frontier.md](docs/compact_frontier.md), which separates one-step quality from continuation stability.
@@ -285,7 +296,7 @@ The current benchmark evidence supports this decomposition:
 - checkpoint replay is a text-memory proxy, not exact residual-state replay
 - the Apollo benchmark is still a constructed harness, not a production task suite
 - quality depends heavily on the selected model and embedding behavior
-- true hidden-state injection is currently implemented only for a narrow GPT-2-class phase 2A verification path
+- true hidden-state injection is currently implemented only for the narrow HF verification path exercised so far (currently GPT-2-class and Gemma 4 text-only prompts)
 - compact replay is currently a narrow target-token experiment, not yet a general continuation path
 - the memory ledger now supports a conservative reversible lifecycle step: `warm -> cold` can be applied, while `archived` and `pruned` remain reporting-only
 - the current `cold` policy is intentionally narrow and tuned around replay-quality failures rather than generic retrieval participation

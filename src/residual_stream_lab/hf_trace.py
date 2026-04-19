@@ -58,6 +58,7 @@ class HFTraceRunner:
             from huggingface_hub import snapshot_download
             from transformers import AutoModelForCausalLM, AutoTokenizer
             from transformers.models.gpt2.modeling_gpt2 import create_causal_mask
+            from transformers.models.gemma4.modeling_gemma4 import create_masks_for_generate
             from transformers.cache_utils import DynamicCache
         except ImportError as exc:  # pragma: no cover - dependency-gated
             raise RuntimeError(
@@ -73,6 +74,7 @@ class HFTraceRunner:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._snapshot_download = snapshot_download
         self._create_causal_mask = create_causal_mask
+        self._create_masks_for_generate = create_masks_for_generate
         self._dynamic_cache_class = DynamicCache
         resolved_model_path = self._resolve_model_path(model_name_or_path)
         self._model_name_or_path = str(resolved_model_path)
@@ -143,6 +145,8 @@ class HFTraceRunner:
     def _trace_inputs(self, input_ids: object, attention_mask: object) -> HFTraceSession:
         if hasattr(self.model, "transformer") and hasattr(self.model.transformer, "h"):
             return self._trace_gpt2_inputs(input_ids=input_ids, attention_mask=attention_mask)
+        if self._is_gemma_text_model():
+            return self._trace_gemma_inputs(input_ids=input_ids, attention_mask=attention_mask)
 
         with self._torch.no_grad():
             output = self.model(
@@ -161,6 +165,44 @@ class HFTraceRunner:
             logical_layer = index - 1
             values = hidden_state[0].detach().cpu().to(self._torch.float32).numpy()
             layer_states[logical_layer] = values
+        return HFTraceSession(
+            input_ids=input_ids_list,
+            tokens=tokens,
+            attention_mask=attention_mask_list,
+            layer_states=layer_states,
+        )
+
+    def _trace_gemma_inputs(self, *, input_ids: object, attention_mask: object) -> HFTraceSession:
+        text_model = self._require_gemma_text_model()
+        with self._torch.no_grad():
+            hidden_states, causal_mask_mapping, position_ids, per_layer_inputs = self._prepare_gemma_hidden_inputs(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
+            layer_states: dict[int, np.ndarray] = {
+                -1: hidden_states[0].detach().cpu().to(self._torch.float32).numpy()
+            }
+            position_embeddings = {
+                layer_type: text_model.rotary_emb(hidden_states, position_ids, layer_type)
+                for layer_type in text_model.unique_layer_types
+            }
+            shared_kv_states: dict[int, tuple[object, object]] = {}
+            for layer_index, decoder_layer in enumerate(text_model.layers[: text_model.config.num_hidden_layers]):
+                per_layer_input = per_layer_inputs[:, :, layer_index, :] if per_layer_inputs is not None else None
+                hidden_states = decoder_layer(
+                    hidden_states,
+                    per_layer_input,
+                    shared_kv_states=shared_kv_states,
+                    position_embeddings=position_embeddings[text_model.config.layer_types[layer_index]],
+                    attention_mask=causal_mask_mapping[text_model.config.layer_types[layer_index]],
+                    position_ids=position_ids,
+                    past_key_values=None,
+                )
+                layer_states[layer_index] = hidden_states[0].detach().cpu().to(self._torch.float32).numpy()
+
+        input_ids_list = input_ids[0].detach().cpu().tolist()
+        attention_mask_list = attention_mask[0].detach().cpu().tolist()
+        tokens = self.tokenizer.convert_ids_to_tokens(input_ids_list)
         return HFTraceSession(
             input_ids=input_ids_list,
             tokens=tokens,
@@ -214,6 +256,36 @@ class HFTraceRunner:
             )
         return transformer
 
+    def _is_gemma_text_model(self) -> bool:
+        return (
+            hasattr(self.model, "model")
+            and hasattr(self.model.model, "language_model")
+            and hasattr(self.model.model.language_model, "layers")
+            and hasattr(self.model.model.language_model, "norm")
+            and hasattr(self.model, "lm_head")
+        )
+
+    def _require_gemma_text_model(self) -> object:
+        if not self._is_gemma_text_model():
+            raise NotImplementedError(
+                "Phase 2A resume is currently implemented only for GPT-2-class models and text-only Gemma 4 models."
+            )
+        text_model = self.model.model.language_model
+        required = [
+            "layers",
+            "norm",
+            "embed_tokens",
+            "rotary_emb",
+            "get_per_layer_inputs",
+            "project_per_layer_inputs",
+            "unique_layer_types",
+        ]
+        if any(not hasattr(text_model, name) for name in required):
+            raise NotImplementedError(
+                "Gemma resume path requires the Gemma text language_model stack with per-layer inputs and rotary embeddings."
+            )
+        return text_model
+
     def _build_causal_attention_mask(
         self,
         hidden_tensor: object,
@@ -257,6 +329,33 @@ class HFTraceRunner:
         )
         return hidden_states, causal_attention_mask, position_ids
 
+    def _prepare_gemma_hidden_inputs(
+        self,
+        *,
+        input_ids: object,
+        attention_mask: object,
+        past_key_values: object | None = None,
+        position_ids: object | None = None,
+    ) -> tuple[object, dict[str, object], object, object | None]:
+        text_model = self._require_gemma_text_model()
+        inputs_embeds = text_model.embed_tokens(input_ids)
+        per_layer_inputs = None
+        if text_model.hidden_size_per_layer_input:
+            per_layer_inputs = text_model.get_per_layer_inputs(input_ids, inputs_embeds)
+            per_layer_inputs = text_model.project_per_layer_inputs(inputs_embeds, per_layer_inputs)
+        if position_ids is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            position_ids = self._torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
+            position_ids = position_ids.unsqueeze(0)
+        causal_mask_mapping = self._create_masks_for_generate(
+            self.model.config,
+            inputs_embeds,
+            attention_mask,
+            past_key_values,
+            position_ids=position_ids,
+        )
+        return inputs_embeds, causal_mask_mapping, position_ids, per_layer_inputs
+
     def _make_dynamic_cache(self) -> object:
         return self._dynamic_cache_class(config=self.model.config)
 
@@ -290,6 +389,57 @@ class HFTraceRunner:
         hidden_tensor = transformer.ln_f(hidden_tensor)
         return hidden_tensor, past_key_values
 
+    def _run_gemma_upper_stack(
+        self,
+        *,
+        hidden_tensor: object,
+        start_layer: int,
+        attention_mask_mapping: dict[str, object],
+        position_ids: object,
+        per_layer_inputs: object | None,
+        shared_kv_states: dict[int, tuple[object, object]] | None = None,
+        past_key_values: object | None = None,
+    ) -> tuple[object, object | None]:
+        text_model = self._require_gemma_text_model()
+        position_embeddings = {
+            layer_type: text_model.rotary_emb(hidden_tensor, position_ids, layer_type)
+            for layer_type in text_model.unique_layer_types
+        }
+        shared_kv_states = shared_kv_states or {}
+        for layer_index in range(start_layer, text_model.config.num_hidden_layers):
+            decoder_layer = text_model.layers[layer_index]
+            per_layer_input = per_layer_inputs[:, :, layer_index, :] if per_layer_inputs is not None else None
+            hidden_tensor = decoder_layer(
+                hidden_tensor,
+                per_layer_input,
+                shared_kv_states=shared_kv_states,
+                position_embeddings=position_embeddings[text_model.config.layer_types[layer_index]],
+                attention_mask=attention_mask_mapping[text_model.config.layer_types[layer_index]],
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+            )
+        hidden_tensor = text_model.norm(hidden_tensor)
+        return hidden_tensor, past_key_values
+
+    def _apply_output_head(self, hidden_tensor: object) -> object:
+        logits = self.model.lm_head(hidden_tensor)
+        text_config = self.model.config.get_text_config() if hasattr(self.model.config, "get_text_config") else self.model.config
+        final_logit_softcapping = getattr(text_config, "final_logit_softcapping", None)
+        if final_logit_softcapping is not None:
+            logits = logits / final_logit_softcapping
+            logits = self._torch.tanh(logits)
+            logits = logits * final_logit_softcapping
+        return logits
+
+    def _clone_shared_kv_states(
+        self,
+        shared_kv_states: dict[int, tuple[object, object]],
+    ) -> dict[int, tuple[object, object]]:
+        cloned: dict[int, tuple[object, object]] = {}
+        for layer_index, (key_states, value_states) in shared_kv_states.items():
+            cloned[layer_index] = (key_states.clone(), value_states.clone())
+        return cloned
+
     def capture_boundary_hidden_from_text(
         self,
         *,
@@ -310,6 +460,12 @@ class HFTraceRunner:
         attention_mask: object,
         boundary_layer: int,
     ) -> np.ndarray:
+        if self._is_gemma_text_model():
+            return self._capture_gemma_boundary_hidden_from_inputs(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                boundary_layer=boundary_layer,
+            )
         transformer = self._require_gpt2_model()
         num_layers = len(transformer.h)
         if boundary_layer < -1 or boundary_layer >= num_layers:
@@ -336,6 +492,64 @@ class HFTraceRunner:
                 hidden_states = block_output[0] if isinstance(block_output, tuple) else block_output
             return hidden_states[0].detach().cpu().to(self._torch.float32).numpy()
 
+    def _capture_gemma_boundary_hidden_from_inputs(
+        self,
+        *,
+        input_ids: object,
+        attention_mask: object,
+        boundary_layer: int,
+    ) -> np.ndarray:
+        boundary_hidden, _ = self._capture_gemma_boundary_context_from_inputs(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            boundary_layer=boundary_layer,
+        )
+        return boundary_hidden
+
+    def _capture_gemma_boundary_context_from_inputs(
+        self,
+        *,
+        input_ids: object,
+        attention_mask: object,
+        boundary_layer: int,
+    ) -> tuple[np.ndarray, dict[int, tuple[object, object]]]:
+        text_model = self._require_gemma_text_model()
+        num_layers = text_model.config.num_hidden_layers
+        if boundary_layer < -1 or boundary_layer >= num_layers:
+            raise ValueError(
+                f"boundary_layer must be between -1 and {num_layers - 1}, got {boundary_layer}."
+            )
+
+        with self._torch.no_grad():
+            hidden_states, causal_mask_mapping, position_ids, per_layer_inputs = self._prepare_gemma_hidden_inputs(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
+            if boundary_layer == -1:
+                return hidden_states[0].detach().cpu().to(self._torch.float32).numpy(), {}
+
+            position_embeddings = {
+                layer_type: text_model.rotary_emb(hidden_states, position_ids, layer_type)
+                for layer_type in text_model.unique_layer_types
+            }
+            shared_kv_states: dict[int, tuple[object, object]] = {}
+            for layer_index in range(0, boundary_layer + 1):
+                decoder_layer = text_model.layers[layer_index]
+                per_layer_input = per_layer_inputs[:, :, layer_index, :] if per_layer_inputs is not None else None
+                hidden_states = decoder_layer(
+                    hidden_states,
+                    per_layer_input,
+                    shared_kv_states=shared_kv_states,
+                    position_embeddings=position_embeddings[text_model.config.layer_types[layer_index]],
+                    attention_mask=causal_mask_mapping[text_model.config.layer_types[layer_index]],
+                    position_ids=position_ids,
+                    past_key_values=None,
+                )
+            return (
+                hidden_states[0].detach().cpu().to(self._torch.float32).numpy(),
+                self._clone_shared_kv_states(shared_kv_states),
+            )
+
     def predict_from_hidden(
         self,
         *,
@@ -343,7 +557,18 @@ class HFTraceRunner:
         start_layer: int,
         attention_mask: list[int],
         target_token_index: int = -1,
+        input_ids: list[int] | None = None,
+        resume_aux_state: object | None = None,
     ) -> np.ndarray:
+        if self._is_gemma_text_model():
+            return self._predict_from_hidden_gemma(
+                hidden_state=hidden_state,
+                start_layer=start_layer,
+                attention_mask=attention_mask,
+                target_token_index=target_token_index,
+                input_ids=input_ids,
+                shared_kv_states=resume_aux_state,
+            )
         transformer = self._require_gpt2_model()
         num_layers = len(transformer.h)
         if start_layer < 0 or start_layer > num_layers:
@@ -360,7 +585,53 @@ class HFTraceRunner:
                 position_ids=position_ids,
                 use_cache=False,
             )
-            logits = self.model.lm_head(hidden_tensor)
+            logits = self._apply_output_head(hidden_tensor)
+
+        resolved_target = target_token_index if target_token_index >= 0 else logits.shape[1] + target_token_index
+        if resolved_target < 0 or resolved_target >= logits.shape[1]:
+            raise ValueError(
+                f"Target token index {target_token_index} resolves to {resolved_target}, "
+                f"but sequence length is {logits.shape[1]}."
+            )
+        return logits[0, resolved_target].detach().cpu().to(self._torch.float32).numpy()
+
+    def _predict_from_hidden_gemma(
+        self,
+        *,
+        hidden_state: np.ndarray,
+        start_layer: int,
+        attention_mask: list[int],
+        target_token_index: int = -1,
+        input_ids: list[int] | None = None,
+        shared_kv_states: dict[int, tuple[object, object]] | None = None,
+    ) -> np.ndarray:
+        text_model = self._require_gemma_text_model()
+        num_layers = text_model.config.num_hidden_layers
+        if start_layer < 0 or start_layer > num_layers:
+            raise ValueError(f"start_layer must be between 0 and {num_layers}, got {start_layer}.")
+        if input_ids is None:
+            raise ValueError("Gemma resume requires the original input_ids to rebuild per-layer text inputs.")
+
+        hidden_tensor = self._torch.tensor(hidden_state, dtype=self.model_dtype, device=self.device).unsqueeze(0)
+        mask_tensor = self._torch.tensor([attention_mask], device=self.device)
+        input_ids_tensor = self._torch.tensor([input_ids], device=self.device)
+        position_ids = self._torch.arange(hidden_tensor.shape[1], device=self.device).unsqueeze(0)
+        _, attention_mask_mapping, _, per_layer_inputs = self._prepare_gemma_hidden_inputs(
+            input_ids=input_ids_tensor,
+            attention_mask=mask_tensor,
+            position_ids=position_ids,
+        )
+        with self._torch.no_grad():
+            hidden_tensor, _ = self._run_gemma_upper_stack(
+                hidden_tensor=hidden_tensor,
+                start_layer=start_layer,
+                attention_mask_mapping=attention_mask_mapping,
+                position_ids=position_ids,
+                per_layer_inputs=per_layer_inputs,
+                shared_kv_states=self._clone_shared_kv_states(shared_kv_states) if shared_kv_states else None,
+                past_key_values=None,
+            )
+            logits = self._apply_output_head(hidden_tensor)
 
         resolved_target = target_token_index if target_token_index >= 0 else logits.shape[1] + target_token_index
         if resolved_target < 0 or resolved_target >= logits.shape[1]:
@@ -378,8 +649,11 @@ class HFTraceRunner:
         target_token_index: int = -1,
     ) -> dict[str, float | int]:
         session = self.trace_text(text)
-        transformer = self._require_gpt2_model()
-        num_layers = len(transformer.h)
+        if self._is_gemma_text_model():
+            num_layers = self._require_gemma_text_model().config.num_hidden_layers
+        else:
+            transformer = self._require_gpt2_model()
+            num_layers = len(transformer.h)
         if boundary_layer < -1 or boundary_layer >= num_layers:
             raise ValueError(
                 f"boundary_layer must be between -1 and {num_layers - 1}, got {boundary_layer}."
@@ -390,11 +664,23 @@ class HFTraceRunner:
             output = self.model(**encoded, output_hidden_states=False, use_cache=False)
         direct_logits = output.logits[0].detach().cpu().to(self._torch.float32).numpy()
 
+        if self._is_gemma_text_model():
+            boundary_hidden, resume_aux_state = self._capture_gemma_boundary_context_from_inputs(
+                input_ids=encoded["input_ids"],
+                attention_mask=encoded["attention_mask"],
+                boundary_layer=boundary_layer,
+            )
+        else:
+            boundary_hidden = session.layer_states[boundary_layer]
+            resume_aux_state = None
+
         resumed_logits = self.predict_from_hidden(
-            hidden_state=session.layer_states[boundary_layer],
+            hidden_state=boundary_hidden,
             start_layer=boundary_layer + 1,
             attention_mask=session.attention_mask,
             target_token_index=target_token_index,
+            input_ids=session.input_ids if self._is_gemma_text_model() else None,
+            resume_aux_state=resume_aux_state,
         )
 
         resolved_target = target_token_index if target_token_index >= 0 else session.token_count + target_token_index
@@ -437,17 +723,27 @@ class HFTraceRunner:
         attention_mask: object,
         boundary_layer: int,
     ) -> np.ndarray:
-        boundary_hidden = self.capture_boundary_hidden_from_inputs(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            boundary_layer=boundary_layer,
-        )
+        if self._is_gemma_text_model():
+            boundary_hidden, resume_aux_state = self._capture_gemma_boundary_context_from_inputs(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                boundary_layer=boundary_layer,
+            )
+        else:
+            boundary_hidden = self.capture_boundary_hidden_from_inputs(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                boundary_layer=boundary_layer,
+            )
+            resume_aux_state = None
         attention_mask_list = attention_mask[0].detach().cpu().tolist()
         return self.predict_from_hidden(
             hidden_state=boundary_hidden,
             start_layer=boundary_layer + 1,
             attention_mask=attention_mask_list,
             target_token_index=-1,
+            input_ids=input_ids[0].detach().cpu().tolist() if self._is_gemma_text_model() else None,
+            resume_aux_state=resume_aux_state,
         )
 
     def _top_k_tokens(
@@ -499,11 +795,10 @@ class HFTraceRunner:
         with self._torch.no_grad():
             output = self.model(**encoded, output_hidden_states=False, use_cache=False)
         direct_logits = output.logits[0, -1].detach().cpu().to(self._torch.float32).numpy()
-        resumed_logits = self.predict_from_hidden(
-            hidden_state=session.layer_states[boundary_layer],
-            start_layer=boundary_layer + 1,
-            attention_mask=session.attention_mask,
-            target_token_index=-1,
+        resumed_logits = self._resumed_next_token_logits_from_inputs(
+            input_ids=encoded["input_ids"],
+            attention_mask=encoded["attention_mask"],
+            boundary_layer=boundary_layer,
         )
 
         direct_token_id = int(np.argmax(direct_logits))

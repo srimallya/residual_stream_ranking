@@ -1359,3 +1359,33 @@ Interpretation:
   - repeated weakness
   - archive eligibility
   - real resurgence
+
+Gemma 4 2B HF path:
+
+- added a repo-local Hugging Face snapshot for:
+  - `models/google--gemma-4-E2B-it`
+- phase 1 is now validated on the Gemma HF text path:
+  - `trace-verify` on `"The capital of France is"` with boundary `30` and deltas `31,32,33` gave:
+    - `L2 = 0.0`
+    - `Exact trace = yes`
+- Gemma phase 2 needed a native resume contract rather than the GPT-2 path:
+  - Gemma 4 uses `Gemma4ForConditionalGeneration`
+  - text replay runs through `model.language_model`
+  - later layers depend on `per_layer_inputs`, rotary position embeddings, and a mixed `full_attention` / `sliding_attention` mask mapping
+  - deeper cuts also require `shared_kv_states` carried from earlier producer layers
+- after adding that Gemma-specific text resume path, the repo-local HF checks are exact on the tested Gemma cut:
+  - phase 2A:
+    - prompt: `"The capital of France is"`
+    - boundary layer: `30`
+    - `L2 = 0.0`
+    - `cos = 1.0`
+    - `max_abs_diff = 0.0`
+  - phase 2B:
+    - same prompt / boundary
+    - next-token logits and top-5 match exactly
+    - greedy token match: yes
+  - phase 2C:
+    - same prompt / boundary
+    - `5/5` greedy continuation steps matched exactly
+    - no divergence observed
+- GPT-2 regression checks remained exact after the Gemma changes, so the Gemma path is additive rather than a rewrite of the existing GPT-2 stack
