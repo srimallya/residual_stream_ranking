@@ -337,6 +337,57 @@ Tested at replay layer `10` on the fixed prompt-family panel:
   - not "compress late bands more"
   - but "compress the replay token better"
 
+## Replay-Token Surrogates Across Replay Layers
+
+The replay-token surrogate family was then widened across replay layers `9`, `10`, and `11` on the same fixed prompt-family panel.
+
+### `fp16` Replay Token
+
+Result:
+
+- `fp16` replay-token storage is continuation-safe across the tested panel at replay layers `9`, `10`, and `11`
+- token agreement stayed `1.00`
+- top-5 full-overlap steps stayed `10/10`
+
+This makes `fp16` the first compressed replay-token surrogate that is safe across the tested replay cuts.
+
+### `int8` Replay Token
+
+Result:
+
+- `int8` replay-token storage remains strong, but it is no longer uniformly safe across replay layers
+- replay layers `9` and `10`:
+  - token agreement stayed `1.00` across the fixed panel
+  - top-5 full-overlap typically fell to `8/10`, `9/10`, or `10/10`
+- replay layer `11`:
+  - still strong on most prompt families
+  - but factual-simple dropped to token agreement `0.60` with first divergence at step `7`
+
+Representative summary:
+
+| Replay Layer | Object | Prompt Family | Token Agreement / 10 | Top-5 Full-Overlap Steps | Current Read |
+| --- | --- | --- | ---: | ---: | --- |
+| `9` | `token@9/fp16` | all tested families | `1.00` | `10/10` | Safe |
+| `9` | `token@9/int8` | factual-simple | `1.00` | `9/10` | Strong but lossy |
+| `9` | `token@9/int8` | narrative | `1.00` | `10/10` | Safe on tested horizon |
+| `10` | `token@10/fp16` | all tested families | `1.00` | `10/10` | Safe |
+| `10` | `token@10/int8` | procedural / instruction-like | `1.00` | `9/10` | Strong but lossy |
+| `11` | `token@11/fp16` | all tested families | `1.00` | `10/10` | Safe |
+| `11` | `token@11/int8` | factual-simple | `0.60` | `6/10` | Unsafe at this cut |
+| `11` | `token@11/int8` | narrative | `1.00` | `8/10` | Strong but lossy |
+
+### Updated Compression Frontier
+
+- `fp16` replay-token compression dominates every previously tested late-band reduction
+- `int8` replay-token compression is the first genuinely interesting lossy frontier:
+  - much smaller than the exact replay token
+  - often preserves perfect token agreement
+  - but now shows real cut sensitivity at replay layer `11`
+
+So the next compression question is sharper again:
+
+- how far can replay-token compression go before cut-sensitive failure begins?
+
 ## Next Widening
 
 - keep this table as the main artifact for the compact branch

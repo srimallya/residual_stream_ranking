@@ -596,6 +596,129 @@ def evaluate_routing_only(
     }
 
 
+def evaluate_routed_replay_bridge(
+    *,
+    cases: list[ApolloCase],
+    routing_runner: GGUFRunner,
+    replay_runner: HFTraceRunner,
+    recent_windows: int,
+    top_k: int,
+    replay_boundary_layer: int,
+    replay_layer: int,
+    replay_steps: int,
+    rerank_strategy: str = "staged",
+    replay_top_k: int = 5,
+) -> dict[str, object]:
+    object_order = [
+        f"token@{replay_layer}",
+        f"token@{replay_layer}/fp16",
+        f"token@{replay_layer}/int8",
+        f"delta_depth={replay_layer - replay_boundary_layer}",
+    ]
+    aggregates: dict[str, dict[str, float | int]] = {
+        label: {
+            "cases": 0,
+            "token_agreement_sum": 0.0,
+            "topk_full_steps_sum": 0,
+            "steps_sum": 0,
+            "divergence_count": 0,
+            "compact_bytes": 0,
+        }
+        for label in object_order
+    }
+    per_case: list[dict[str, object]] = []
+    top1_hits = 0
+    topk_hits = 0
+
+    for case in cases:
+        windows = split_windows(case.document, lines_per_window=case.window_lines)
+        checkpoints = build_checkpoints(windows, routing_runner.embed)
+        recent = windows[-recent_windows:] if recent_windows > 0 else []
+        recent_ids = {window.index for window in recent}
+        recent_checkpoints = [checkpoint for checkpoint in checkpoints if checkpoint.window.index in recent_ids]
+        query_embedding = routing_runner.embed(case.question)
+        ranked = rerank_checkpoints(
+            checkpoints,
+            query_embedding=query_embedding,
+            query_text=case.question,
+            top_k=top_k,
+            exclude_window_ids=recent_ids,
+            recent_windows=recent_checkpoints,
+            strategy=rerank_strategy,
+        )
+        ranked_ids = [checkpoint.window.index for checkpoint in ranked]
+        top1_hit = bool(ranked_ids) and ranked_ids[0] == case.target_window_index
+        topk_hit = case.target_window_index in ranked_ids
+        top1_hits += int(top1_hit)
+        topk_hits += int(topk_hit)
+
+        case_row: dict[str, object] = {
+            "case_id": case.case_id,
+            "distance_bin": case.distance_bin,
+            "ranked_ids": ranked_ids,
+            "top1_hit": top1_hit,
+            "topk_hit": topk_hit,
+            "target_window_index": case.target_window_index,
+        }
+
+        if top1_hit and ranked:
+            routed_window_text = ranked[0].window.text
+            replay_result = replay_runner.compare_compact_continuation_variants(
+                text=routed_window_text,
+                boundary_layer=replay_boundary_layer,
+                replay_layer=replay_layer,
+                delta_depths=[replay_layer - replay_boundary_layer],
+                steps=replay_steps,
+                top_k=replay_top_k,
+            )
+            replay_rows = {
+                row["object_label"]: row
+                for row in replay_result["rows"]
+                if row["object_label"] in object_order
+            }
+            case_row["replay"] = replay_rows
+            for label in object_order:
+                row = replay_rows[label]
+                aggregate = aggregates[label]
+                aggregate["cases"] += 1
+                aggregate["token_agreement_sum"] += float(row["token_agreement"])
+                aggregate["topk_full_steps_sum"] += int(row["topk_full_steps"])
+                aggregate["steps_sum"] += int(row["steps_completed"])
+                aggregate["divergence_count"] += int(row["first_divergence_step"] is not None)
+                if aggregate["compact_bytes"] == 0:
+                    aggregate["compact_bytes"] = int(row["compact_bytes"])
+
+        per_case.append(case_row)
+
+    summary_rows: list[dict[str, object]] = []
+    for label in object_order:
+        aggregate = aggregates[label]
+        cases_count = int(aggregate["cases"])
+        steps_sum = int(aggregate["steps_sum"])
+        summary_rows.append(
+            {
+                "object_label": label,
+                "cases": cases_count,
+                "compact_bytes": int(aggregate["compact_bytes"]),
+                "token_agreement": (float(aggregate["token_agreement_sum"]) / cases_count) if cases_count else 0.0,
+                "topk_full_rate": (int(aggregate["topk_full_steps_sum"]) / steps_sum) if steps_sum else 0.0,
+                "divergence_rate": (int(aggregate["divergence_count"]) / cases_count) if cases_count else 0.0,
+            }
+        )
+
+    return {
+        "case_count": len(cases),
+        "top1_hit_rate": top1_hits / len(cases) if cases else 0.0,
+        "topk_hit_rate": topk_hits / len(cases) if cases else 0.0,
+        "rerank_strategy": rerank_strategy,
+        "replay_boundary_layer": replay_boundary_layer,
+        "replay_layer": replay_layer,
+        "replay_steps": replay_steps,
+        "summary_rows": summary_rows,
+        "per_case": per_case,
+    }
+
+
 @app.command("trace-verify")
 def trace_verify(
     model_name_or_path: str = typer.Option(..., help="Transformers model id or local path."),
@@ -1746,6 +1869,90 @@ def route_apollo(
             f"{summary['mrr']:.2f}",
         )
     console.print(table)
+
+
+@app.command("bridge-apollo-replay")
+def bridge_apollo_replay(
+    model_path: str = typer.Option(..., help="Path to the GGUF routing model."),
+    hf_model_name_or_path: str = typer.Option(..., help="Transformers model id or local path for replay evaluation."),
+    corpus_path: str = typer.Option("data/apollo11_clean.txt", help="Path to the Apollo corpus text file."),
+    case_count: int = typer.Option(6, min=3, help="Number of generated benchmark cases."),
+    windows: int = typer.Option(12, min=6, help="Number of windows per case."),
+    window_lines: int = typer.Option(24, min=8, help="Lines per window."),
+    recent_windows: int = typer.Option(2, min=0, help="Exact local context horizon in windows."),
+    top_k: int = typer.Option(4, min=1, help="Candidate count kept after staged reranking."),
+    seed: int = typer.Option(7, help="Deterministic benchmark seed."),
+    n_ctx: int = typer.Option(4096, min=1024, help="Inference context size for the GGUF routing model."),
+    replay_boundary_layer: int = typer.Option(6, help="Boundary layer for the replay object."),
+    replay_layer: int = typer.Option(10, help="Replay layer for tracked replay objects."),
+    replay_steps: int = typer.Option(10, min=1, help="Greedy continuation horizon for replay-object checks."),
+    replay_top_k: int = typer.Option(5, min=1, help="Top-k width used for replay ranking stability."),
+    hf_device: str = typer.Option("cpu", help="Torch device for the HF replay backend."),
+    hf_dtype: str = typer.Option("auto", help="Torch dtype: auto, float32, float16, or bfloat16."),
+) -> None:
+    routing_runner = GGUFRunner(model_path=model_path, n_ctx=n_ctx)
+    replay_runner = HFTraceRunner(
+        model_name_or_path=hf_model_name_or_path,
+        device=hf_device,
+        dtype=hf_dtype,
+    )
+    cases = build_apollo_cases(
+        corpus_path=corpus_path,
+        case_count=case_count,
+        windows=windows,
+        window_lines=window_lines,
+        recent_windows=recent_windows,
+        seed=seed,
+    )
+    summary = evaluate_routed_replay_bridge(
+        cases=cases,
+        routing_runner=routing_runner,
+        replay_runner=replay_runner,
+        recent_windows=recent_windows,
+        top_k=top_k,
+        replay_boundary_layer=replay_boundary_layer,
+        replay_layer=replay_layer,
+        replay_steps=replay_steps,
+        rerank_strategy="staged",
+        replay_top_k=replay_top_k,
+    )
+
+    console.print(
+        "[bold]Apollo Routed Replay Bridge[/bold]\n"
+        "Uses staged routing (semantic pool -> temporal/PageRank rerank -> graph-local refinement), then evaluates tracked replay objects only on top-1 routed hits."
+    )
+    console.print(f"Routing backend: {routing_runner.backend} ({routing_runner.backend_reason})")
+    console.print(f"Replay backend: {replay_runner.backend}")
+    console.print(f"HF replay model: {replay_runner.model_name_or_path}")
+    console.print(f"Cases: {summary['case_count']}")
+    console.print(f"Rerank strategy: {summary['rerank_strategy']}")
+    console.print(f"Replay cut: boundary {summary['replay_boundary_layer']} -> layer {summary['replay_layer']}")
+    console.print(f"Replay horizon: {summary['replay_steps']} steps")
+
+    routing_table = Table(title="Routing Bridge Summary")
+    routing_table.add_column("Metric")
+    routing_table.add_column("Value")
+    routing_table.add_row("Top-1 hit rate", f"{summary['top1_hit_rate']:.2f}")
+    routing_table.add_row("Top-K hit rate", f"{summary['topk_hit_rate']:.2f}")
+    console.print(routing_table)
+
+    replay_table = Table(title="Hit-Conditioned Replay Object Summary")
+    replay_table.add_column("Object")
+    replay_table.add_column("Bytes")
+    replay_table.add_column("Hit Cases")
+    replay_table.add_column("Token Agreement")
+    replay_table.add_column(f"Top-{replay_top_k} Full Rate")
+    replay_table.add_column("Divergence Rate")
+    for row in summary["summary_rows"]:
+        replay_table.add_row(
+            str(row["object_label"]),
+            str(row["compact_bytes"]),
+            str(row["cases"]),
+            f"{row['token_agreement']:.2f}",
+            f"{row['topk_full_rate']:.2f}",
+            f"{row['divergence_rate']:.2f}",
+        )
+    console.print(replay_table)
 
 
 if __name__ == "__main__":

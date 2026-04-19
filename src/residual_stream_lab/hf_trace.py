@@ -810,6 +810,10 @@ class HFTraceRunner:
     ) -> dict[str, object]:
         exact_encoded = self._encode_text(text)
         full_delta_depth = replay_layer - boundary_layer
+        exact_trace_bytes = int((full_delta_depth + 1) * self.model.config.n_embd * np.dtype(np.float32).itemsize)
+        replay_token_bytes = int(self.model.config.n_embd * np.dtype(np.float32).itemsize)
+        replay_token_fp16_bytes = int(self.model.config.n_embd * np.dtype(np.float16).itemsize)
+        replay_token_int8_bytes = int(self.model.config.n_embd * np.dtype(np.int8).itemsize + np.dtype(np.float32).itemsize)
 
         rows: list[dict[str, object]] = []
         seen_depths: set[int] = set()
@@ -890,6 +894,9 @@ class HFTraceRunner:
                     "object_label": f"delta_depth={depth}",
                     "delta_depth": depth,
                     "kept_layers": list(range(replay_layer - depth + 1, replay_layer + 1)) if depth > 0 else [],
+                    "compact_bytes": int((depth + 1) * self.model.config.n_embd * np.dtype(np.float32).itemsize),
+                    "full_replay_token_bytes": replay_token_bytes,
+                    "full_trace_bytes": exact_trace_bytes,
                     "token_agreement": token_matches / len(per_step) if per_step else 0.0,
                     "topk_full_steps": full_topk_steps,
                     "steps_completed": len(per_step),
@@ -974,6 +981,15 @@ class HFTraceRunner:
                     "object_label": surrogate_label,
                     "delta_depth": None,
                     "kept_layers": [replay_layer],
+                    "compact_bytes": (
+                        replay_token_bytes
+                        if surrogate_kind == "replay_token"
+                        else replay_token_fp16_bytes
+                        if surrogate_kind == "replay_token_fp16"
+                        else replay_token_int8_bytes
+                    ),
+                    "full_replay_token_bytes": replay_token_bytes,
+                    "full_trace_bytes": exact_trace_bytes,
                     "token_agreement": token_matches / len(surrogate_steps) if surrogate_steps else 0.0,
                     "topk_full_steps": full_topk_steps,
                     "steps_completed": len(surrogate_steps),

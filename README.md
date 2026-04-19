@@ -240,6 +240,21 @@ Probe compact replay objects against the exact replay baseline:
 
 The compact replay branch now has a dedicated frontier table in [docs/compact_frontier.md](docs/compact_frontier.md), which separates one-step quality from continuation stability.
 
+Bridge routed Apollo selection into tracked replay evaluation:
+
+```bash
+.venv/bin/python -m residual_stream_lab.cli bridge-apollo-replay \
+  --model-path models/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf \
+  --hf-model-name-or-path models/gpt2 \
+  --case-count 6 \
+  --top-k 4 \
+  --replay-boundary-layer 6 \
+  --replay-layer 10 \
+  --replay-steps 10
+```
+
+`bridge-apollo-replay` keeps the staged Apollo router (`semantic pool -> temporal/PageRank rerank -> graph-local refinement`) and, on routed top-1 hits, scores tracked replay objects on the selected region instead of falling back to a text-only replay story.
+
 ## Interpreting Results
 
 Expected behavior for the current prototype:

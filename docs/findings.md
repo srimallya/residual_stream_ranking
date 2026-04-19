@@ -864,3 +864,40 @@ Replay-token surrogates:
   - `int8` replay-token storage preserved token agreement across the tested panel, with only modest top-k degradation
 - updated design axis:
   - the most promising compact branch is now replay-token compression, not further late-band thinning
+
+Cross-layer surrogate widening:
+
+- the replay-token surrogate family was then widened across replay layers `9`, `10`, and `11`
+- corrected read:
+  - `fp16` replay-token storage is continuation-safe across the tested panel at all three replay layers
+  - `int8` replay-token storage remains strong, but now shows real cut sensitivity:
+    - replay layers `9` and `10`: token agreement stayed perfect on the tested panel
+    - replay layer `11`: factual-simple dropped to token agreement `0.60` with divergence at step `7`
+- updated frontier:
+  - `fp16` replay-token compression is now the strongest safe compact surrogate family on the tested panel
+  - `int8` replay-token compression is the first genuinely interesting lossy boundary
+
+Routing -> replay bridge:
+
+- a bridge command now connects the staged Apollo router to the tracked replay path:
+  - semantic pool selection
+  - temporal/PageRank rerank inside the pool
+  - graph-local refinement
+  - then hit-conditioned replay-object evaluation on the routed top-1 region
+- first live validation on a small Apollo slice:
+  - router: local Qwen3.5 2B GGUF
+  - replay backend: repo-local `gpt2`
+  - cases: `3`
+  - staged routing top-1 hit rate: `0.67`
+  - staged routing top-k hit rate: `1.00`
+- on the two routed hits in that slice, the tracked replay objects all remained clean over the tested `10`-step horizon:
+  - `token@10`
+  - `token@10/fp16`
+  - `token@10/int8`
+  - full late band `delta_depth=4`
+
+Current bridge read:
+
+- the project now has an actual routing -> replay architecture path, not just two disconnected sub-results
+- the first bridge validation is small, but it shows the intended stack is executable end to end
+- the next bridge question is no longer "can we connect them?" but "which replay object wins once the routed hit slice gets larger and harder?"
