@@ -675,3 +675,119 @@ Updated compact-replay read:
   - take the strongest reduced objects
   - run short continuation horizons against the exact baseline
   - measure where the compact object stops being behaviorally faithful
+
+### Compact Replay: Short-Horizon Continuation
+
+The compact branch was then extended from one-step prediction to short-horizon continuation against the exact replay baseline.
+
+Tested configuration:
+
+- boundary layer: `6`
+- replay layer: `10`
+- horizon: `10` greedy steps
+- compact candidates:
+  - depth `0`: boundary only
+  - depth `2`: keep `9,10`
+  - depth `3`: keep `8,9,10`
+  - depth `4`: keep `7,8,9,10` (full local band)
+
+Prompt:
+
+```text
+The capital of France is
+```
+
+Observed result:
+
+- depth `0`:
+  - token agreement: `0.10`
+  - top-5 full-overlap steps: `0/10`
+  - first divergence step: `2`
+- depth `2`:
+  - token agreement: `0.60`
+  - top-5 full-overlap steps: `3/10`
+  - first divergence step: `7`
+- depth `3`:
+  - token agreement: `1.00`
+  - top-5 full-overlap steps: `5/10`
+  - no greedy-token divergence in the tested horizon
+- depth `4`:
+  - token agreement: `1.00`
+  - top-5 full-overlap steps: `10/10`
+  - no divergence in the tested horizon
+
+Second prompt:
+
+```text
+The capital of France is Paris and the capital of Japan is
+```
+
+Observed result:
+
+- depth `0`:
+  - token agreement: `0.50`
+  - top-5 full-overlap steps: `0/10`
+  - first divergence step: `1`
+- depth `2`:
+  - token agreement: `0.80`
+  - top-5 full-overlap steps: `3/10`
+  - first divergence step: `9`
+- depth `3`:
+  - token agreement: `1.00`
+  - top-5 full-overlap steps: `5/10`
+  - no greedy-token divergence in the tested horizon
+- depth `4`:
+  - token agreement: `1.00`
+  - top-5 full-overlap steps: `10/10`
+  - no divergence in the tested horizon
+
+Third prompt:
+
+```text
+Alice opened the red door and found a small brass key that
+```
+
+Observed result:
+
+- depth `0`:
+  - token agreement: `0.00`
+  - top-5 full-overlap steps: `0/10`
+  - first divergence step: `1`
+- depth `2`:
+  - token agreement: `0.70`
+  - top-5 full-overlap steps: `4/10`
+  - first divergence step: `6`
+- depth `3`:
+  - token agreement: `0.10`
+  - top-5 full-overlap steps: `1/10`
+  - first divergence step: `1`
+- depth `4`:
+  - token agreement: `1.00`
+  - top-5 full-overlap steps: `10/10`
+  - no divergence in the tested horizon
+
+Interpretation:
+
+- the full local band (`7,8,9,10`) is not just one-step aligned; it remains continuation-faithful across the tested 10-step horizon on all three prompts
+- reduced objects can remain locally plausible while failing over continuation
+- depth `3` is especially instructive:
+  - it preserved greedy-token agreement on both geography prompts
+  - but only `5/10` steps retained full top-5 overlap
+  - and it failed badly on the narrative prompt
+- therefore, compact one-step quality is not enough to certify continuation stability
+
+Updated compact-continuation read:
+
+- the compact replay frontier is real and non-smooth
+- intermediate reduced objects can look strong on easy prompts and still collapse on harder continuation
+- the current strongest compact candidate is:
+  - boundary layer `6`
+  - replay layer `10`
+  - full local late band `7,8,9,10`
+- that candidate is behaviorally aligned over the tested 10-step horizon, while thinner objects trade away stability for size
+
+Canonical artifact:
+
+- the compact branch now has a dedicated frontier table in `docs/compact_frontier.md`
+- that table keeps one-step status separate from continuation stability
+- it should be treated as the main evidence surface for compact replay, rather than scattered narrative summaries

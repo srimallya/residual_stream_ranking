@@ -138,12 +138,20 @@ class HFTraceRunner:
 
     def trace_text(self, text: str) -> HFTraceSession:
         encoded = self._encode_text(text)
-        with self._torch.no_grad():
-            output = self.model(**encoded, output_hidden_states=True, use_cache=False)
+        return self._trace_inputs(encoded["input_ids"], encoded["attention_mask"])
 
-        input_ids = encoded["input_ids"][0].detach().cpu().tolist()
-        attention_mask = encoded["attention_mask"][0].detach().cpu().tolist()
-        tokens = self.tokenizer.convert_ids_to_tokens(input_ids)
+    def _trace_inputs(self, input_ids: object, attention_mask: object) -> HFTraceSession:
+        with self._torch.no_grad():
+            output = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                use_cache=False,
+            )
+
+        input_ids_list = input_ids[0].detach().cpu().tolist()
+        attention_mask_list = attention_mask[0].detach().cpu().tolist()
+        tokens = self.tokenizer.convert_ids_to_tokens(input_ids_list)
         hidden_states = output.hidden_states
         layer_states: dict[int, np.ndarray] = {}
         for index, hidden_state in enumerate(hidden_states):
@@ -151,9 +159,9 @@ class HFTraceRunner:
             values = hidden_state[0].detach().cpu().to(self._torch.float32).numpy()
             layer_states[logical_layer] = values
         return HFTraceSession(
-            input_ids=input_ids,
+            input_ids=input_ids_list,
             tokens=tokens,
-            attention_mask=attention_mask,
+            attention_mask=attention_mask_list,
             layer_states=layer_states,
         )
 
@@ -578,6 +586,175 @@ class HFTraceRunner:
             "replay_layer": replay_layer,
             "token_index": resolved_token_index,
             "available_delta_layers": full_delta_layers,
+            "rows": rows,
+        }
+
+    def _exact_next_token_logits_from_replay_layer_inputs(
+        self,
+        *,
+        input_ids: object,
+        attention_mask: object,
+        replay_layer: int,
+    ) -> np.ndarray:
+        replay_hidden = self.capture_boundary_hidden_from_inputs(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            boundary_layer=replay_layer,
+        )
+        attention_mask_list = attention_mask[0].detach().cpu().tolist()
+        return self.predict_from_hidden(
+            hidden_state=replay_hidden,
+            start_layer=replay_layer + 1,
+            attention_mask=attention_mask_list,
+            target_token_index=-1,
+        )
+
+    def _compact_next_token_logits_from_inputs(
+        self,
+        *,
+        input_ids: object,
+        attention_mask: object,
+        boundary_layer: int,
+        replay_layer: int,
+        delta_depth: int,
+        token_index: int = -1,
+    ) -> np.ndarray:
+        session = self._trace_inputs(input_ids, attention_mask)
+        resolved_token_index = token_index if token_index >= 0 else session.token_count + token_index
+        if resolved_token_index < 0 or resolved_token_index >= session.token_count:
+            raise ValueError(
+                f"Token index {token_index} resolves to {resolved_token_index}, "
+                f"but the prompt has {session.token_count} tokens."
+            )
+
+        full_delta_layers = list(range(boundary_layer + 1, replay_layer + 1))
+        capped_depth = min(max(delta_depth, 0), len(full_delta_layers))
+        kept_layers = full_delta_layers[-capped_depth:] if capped_depth > 0 else []
+
+        token_boundary_state = np.asarray(session.layer_states[boundary_layer][resolved_token_index], dtype=np.float32).copy()
+        reconstructed_token = token_boundary_state.copy()
+        for layer in kept_layers:
+            reconstructed_token += (
+                np.asarray(session.layer_states[layer][resolved_token_index], dtype=np.float32)
+                - np.asarray(session.layer_states[layer - 1][resolved_token_index], dtype=np.float32)
+            )
+
+        replay_hidden = np.asarray(session.layer_states[replay_layer], dtype=np.float32).copy()
+        replay_hidden[resolved_token_index] = reconstructed_token
+        return self.predict_from_hidden(
+            hidden_state=replay_hidden,
+            start_layer=replay_layer + 1,
+            attention_mask=session.attention_mask,
+            target_token_index=-1,
+        )
+
+    def compare_compact_continuation_variants(
+        self,
+        *,
+        text: str,
+        boundary_layer: int,
+        replay_layer: int,
+        delta_depths: list[int],
+        steps: int,
+        top_k: int = 5,
+    ) -> dict[str, object]:
+        exact_encoded = self._encode_text(text)
+        full_delta_depth = replay_layer - boundary_layer
+
+        rows: list[dict[str, object]] = []
+        seen_depths: set[int] = set()
+        for raw_depth in delta_depths:
+            depth = min(max(int(raw_depth), 0), full_delta_depth)
+            if depth in seen_depths:
+                continue
+            seen_depths.add(depth)
+
+            exact_input_ids = exact_encoded["input_ids"].clone()
+            exact_attention_mask = exact_encoded["attention_mask"].clone()
+            compact_input_ids = exact_encoded["input_ids"].clone()
+            compact_attention_mask = exact_encoded["attention_mask"].clone()
+
+            per_step: list[dict[str, object]] = []
+            first_divergence_step: int | None = None
+
+            for step in range(steps):
+                exact_logits = self._exact_next_token_logits_from_replay_layer_inputs(
+                    input_ids=exact_input_ids,
+                    attention_mask=exact_attention_mask,
+                    replay_layer=replay_layer,
+                )
+                compact_logits = self._compact_next_token_logits_from_inputs(
+                    input_ids=compact_input_ids,
+                    attention_mask=compact_attention_mask,
+                    boundary_layer=boundary_layer,
+                    replay_layer=replay_layer,
+                    delta_depth=depth,
+                    token_index=-1,
+                )
+
+                exact_token_id = int(np.argmax(exact_logits))
+                compact_token_id = int(np.argmax(compact_logits))
+                token_match = exact_token_id == compact_token_id
+                if first_divergence_step is None and not token_match:
+                    first_divergence_step = step + 1
+
+                exact_top_k = self._top_k_tokens(exact_logits, top_k=top_k)
+                compact_top_k = self._top_k_tokens(compact_logits, top_k=top_k)
+                exact_top_ids = {row[0] for row in exact_top_k}
+                compact_top_ids = {row[0] for row in compact_top_k}
+                delta = compact_logits - exact_logits
+                per_step.append(
+                    {
+                        "step": step + 1,
+                        "token_match": token_match,
+                        "topk_overlap": len(exact_top_ids & compact_top_ids),
+                        "topk_size": top_k,
+                        "exact_token_id": exact_token_id,
+                        "exact_token_text": self.tokenizer.decode([exact_token_id]),
+                        "compact_token_id": compact_token_id,
+                        "compact_token_text": self.tokenizer.decode([compact_token_id]),
+                        "l2_error": float(np.linalg.norm(delta)),
+                        "max_abs_diff": float(np.max(np.abs(delta))),
+                    }
+                )
+
+                exact_next_token = self._torch.tensor([[exact_token_id]], device=self.device, dtype=exact_input_ids.dtype)
+                exact_next_mask = self._torch.ones((1, 1), device=self.device, dtype=exact_attention_mask.dtype)
+                exact_input_ids = self._torch.cat([exact_input_ids, exact_next_token], dim=1)
+                exact_attention_mask = self._torch.cat([exact_attention_mask, exact_next_mask], dim=1)
+
+                compact_next_token = self._torch.tensor(
+                    [[compact_token_id]],
+                    device=self.device,
+                    dtype=compact_input_ids.dtype,
+                )
+                compact_next_mask = self._torch.ones((1, 1), device=self.device, dtype=compact_attention_mask.dtype)
+                compact_input_ids = self._torch.cat([compact_input_ids, compact_next_token], dim=1)
+                compact_attention_mask = self._torch.cat([compact_attention_mask, compact_next_mask], dim=1)
+
+            token_matches = sum(1 for row in per_step if row["token_match"])
+            full_topk_steps = sum(1 for row in per_step if row["topk_overlap"] == row["topk_size"])
+            rows.append(
+                {
+                    "delta_depth": depth,
+                    "kept_layers": list(range(replay_layer - depth + 1, replay_layer + 1)) if depth > 0 else [],
+                    "token_agreement": token_matches / len(per_step) if per_step else 0.0,
+                    "topk_full_steps": full_topk_steps,
+                    "steps_completed": len(per_step),
+                    "first_divergence_step": first_divergence_step,
+                    "final_l2_error": per_step[-1]["l2_error"] if per_step else 0.0,
+                    "final_max_abs_diff": per_step[-1]["max_abs_diff"] if per_step else 0.0,
+                    "exact_text": self.tokenizer.decode(exact_input_ids[0].detach().cpu().tolist()),
+                    "compact_text": self.tokenizer.decode(compact_input_ids[0].detach().cpu().tolist()),
+                    "per_step": per_step,
+                }
+            )
+
+        rows.sort(key=lambda row: row["delta_depth"])
+        return {
+            "boundary_layer": boundary_layer,
+            "replay_layer": replay_layer,
+            "steps_requested": steps,
             "rows": rows,
         }
 

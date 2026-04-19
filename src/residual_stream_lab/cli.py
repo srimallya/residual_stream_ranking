@@ -939,6 +939,69 @@ def trace_compact_sweep(
         console.print(metrics)
 
 
+@app.command("trace-compact-operational")
+def trace_compact_operational(
+    model_name_or_path: str = typer.Option(..., help="Transformers model id or local path."),
+    prompt: str = typer.Option(..., help="Prompt to trace and compact-replay from."),
+    boundary_layer: int = typer.Option(..., help="Boundary layer where the compact object starts."),
+    replay_layer: int = typer.Option(..., help="Later layer reconstructed from the compact object."),
+    delta_depths: str = typer.Option(
+        "0,2,4",
+        help="Comma-separated counts of trailing deltas to keep between boundary and replay layer.",
+    ),
+    steps: int = typer.Option(10, min=1, help="Greedy continuation horizon."),
+    top_k: int = typer.Option(5, min=1, help="Top-k width used for overlap scoring."),
+    device: str = typer.Option("cpu", help="Torch device for the HF trace backend."),
+    dtype: str = typer.Option("auto", help="Torch dtype: auto, float32, float16, or bfloat16."),
+) -> None:
+    parsed_delta_depths = parse_int_list(delta_depths, unique=True, ascending=True)
+
+    runner = HFTraceRunner(
+        model_name_or_path=model_name_or_path,
+        device=device,
+        dtype=dtype,
+    )
+    result = runner.compare_compact_continuation_variants(
+        text=prompt,
+        boundary_layer=boundary_layer,
+        replay_layer=replay_layer,
+        delta_depths=parsed_delta_depths,
+        steps=steps,
+        top_k=top_k,
+    )
+
+    console.print(
+        "[bold]HF Compact Operational Comparison[/bold]\n"
+        "Measures how reduced replay objects hold up over short greedy continuation against the exact replay baseline."
+    )
+    console.print(f"Backend: {runner.backend}")
+    console.print(f"Model: {runner.model_name_or_path}")
+    console.print(f"Boundary layer: {result['boundary_layer']}")
+    console.print(f"Replay layer: {result['replay_layer']}")
+    console.print(f"Steps requested: {result['steps_requested']}")
+
+    table = Table(title="Compact Continuation Envelope")
+    table.add_column("Depth")
+    table.add_column("Kept Layers")
+    table.add_column("Token Agreement")
+    table.add_column(f"Top-{top_k}")
+    table.add_column("First Divergence")
+    table.add_column("Final L2")
+    table.add_column("Final Max Abs Diff")
+    for row in result["rows"]:
+        kept_layers = ",".join(str(layer) for layer in row["kept_layers"]) or "-"
+        table.add_row(
+            str(row["delta_depth"]),
+            kept_layers,
+            f"{row['token_agreement']:.2f}",
+            f"{row['topk_full_steps']}/{row['steps_completed']}",
+            "-" if row["first_divergence_step"] is None else str(row["first_divergence_step"]),
+            f"{row['final_l2_error']:.8f}",
+            f"{row['final_max_abs_diff']:.8f}",
+        )
+    console.print(table)
+
+
 @app.command("trace-generate-kv-verify")
 def trace_generate_kv_verify(
     model_name_or_path: str = typer.Option(..., help="Transformers model id or local path."),

@@ -238,6 +238,8 @@ Probe compact replay objects against the exact replay baseline:
 `trace-verify` captures observed layer outputs for one token, stores the boundary state plus incremental deltas, and checks offline reconstruction. `trace-resume-verify` takes the next narrow step: inject a captured full-sequence boundary hidden state at one layer, run the remaining layers, and compare resumed logits against the direct pass for one target token.
 `trace-compact-sweep` asks a different question: if exact prefix states are kept, how many late-layer deltas for the target token must remain in the replay object before next-token behavior lines up with the exact replay baseline again?
 
+The compact replay branch now has a dedicated frontier table in [docs/compact_frontier.md](docs/compact_frontier.md), which separates one-step quality from continuation stability.
+
 ## Interpreting Results
 
 Expected behavior for the current prototype:
