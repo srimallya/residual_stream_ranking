@@ -104,12 +104,17 @@ class GGUFRunner:
                     "content": (
                         "You answer questions from provided memory only. "
                         "If the answer is missing, reply with UNKNOWN. "
-                        "Return only the final short answer."
+                        "Return exactly one XML tag in the form <answer>VALUE</answer>. "
+                        "VALUE must be a single short answer token with no explanation."
                     ),
                 },
                 {
                     "role": "user",
-                    "content": f"Memory:\n{memory}\n\nQuestion: {question_text}",
+                    "content": (
+                        f"Memory:\n{memory}\n\n"
+                        f"Question: {question_text}\n\n"
+                        "Output format: <answer>VALUE</answer>"
+                    ),
                 },
             ],
             max_tokens=max(max_tokens, 512) if "qwen3.5" in self.model_name else max_tokens,

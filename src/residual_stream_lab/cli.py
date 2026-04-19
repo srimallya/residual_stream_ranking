@@ -94,14 +94,35 @@ def build_oracle_memory(
 
 
 def extract_atomic_answer(prediction: str, valid_answers: set[str]) -> str | None:
+    def normalize_candidate(candidate: str) -> str | None:
+        cleaned = candidate.strip(" .,:;!?*`[](){}<>\"'").lower()
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        if not cleaned:
+            return None
+        if cleaned in valid_answers:
+            return cleaned
+        if cleaned == "unknown":
+            return cleaned
+        if re.fullmatch(r"[a-z][a-z\-]*", cleaned):
+            return cleaned
+        return None
+
     lowered = prediction.strip().lower()
     if not lowered:
         return None
 
+    tag_matches = re.findall(r"<answer>\s*([^<]+?)\s*</answer>", lowered, flags=re.IGNORECASE | re.DOTALL)
+    for candidate in reversed(tag_matches):
+        normalized = normalize_candidate(candidate)
+        if normalized is not None:
+            return normalized
+
     lines = [line.strip(" -*`\t") for line in lowered.splitlines() if line.strip()]
     for line in reversed(lines):
-        if line in valid_answers:
-            return line
+        line = re.sub(r"^(final answer|answer|color)\s*[:\-]\s*", "", line).strip()
+        normalized = normalize_candidate(line)
+        if normalized is not None:
+            return normalized
         for answer in valid_answers:
             if re.search(rf"\b{re.escape(answer)}\b", line):
                 return answer
@@ -138,6 +159,38 @@ def exact_match(prediction: str, answer: str) -> bool:
     left = prediction.strip().lower().strip(".")
     right = answer.strip().lower().strip(".")
     return left == right
+
+
+def format_prediction_snippet(prediction: str, limit: int = 120) -> str:
+    compact = re.sub(r"\s+", " ", prediction.strip())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3] + "..."
+
+
+def collect_parse_failures(
+    per_case: list[dict[str, object]],
+    *,
+    modes: tuple[str, ...] = ("full", "temporal"),
+    limit: int = 8,
+) -> list[dict[str, str]]:
+    failures: list[dict[str, str]] = []
+    for entry in per_case:
+        for mode in modes:
+            result = entry["results"][mode]
+            if result["parse_success"]:
+                continue
+            failures.append(
+                {
+                    "case_id": str(entry["case_id"]),
+                    "distance": str(entry["distance_bin"]),
+                    "mode": mode,
+                    "prediction": format_prediction_snippet(str(result["prediction"])),
+                }
+            )
+            if len(failures) >= limit:
+                return failures
+    return failures
 
 
 def evaluate_case_modes(
@@ -683,6 +736,22 @@ def benchmark_apollo(
     ]:
         breakdown_table.add_row(label, f"{retrieval_value:.2f}", f"{temporal_value:.2f}")
     console.print(breakdown_table)
+
+    parse_failures = collect_parse_failures(per_case)
+    if parse_failures:
+        failures_table = Table(title="Parse Failures")
+        failures_table.add_column("Case")
+        failures_table.add_column("Distance")
+        failures_table.add_column("Mode")
+        failures_table.add_column("Raw Output")
+        for failure in parse_failures:
+            failures_table.add_row(
+                failure["case_id"],
+                failure["distance"],
+                failure["mode"],
+                failure["prediction"],
+            )
+        console.print(failures_table)
 
 
 @app.command("sweep-apollo")
