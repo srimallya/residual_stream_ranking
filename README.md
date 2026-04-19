@@ -253,7 +253,13 @@ Bridge routed Apollo selection into tracked replay evaluation:
   --replay-steps 10
 ```
 
-`bridge-apollo-replay` keeps the staged Apollo router (`semantic pool -> temporal/PageRank rerank -> graph-local refinement`) and, on routed top-1 hits, scores tracked replay objects alongside a plain `text@window` control on the selected region. The command now also emits a read-only memory ledger report with tier counts, the low-utility tail, and reporting-only archive/prune suggestions for the replay objects it observed.
+`bridge-apollo-replay` keeps the staged Apollo router (`semantic pool -> temporal/PageRank rerank -> graph-local refinement`) and, on routed top-1 hits, scores tracked replay objects alongside a plain `text@window` control on the selected region. It also persists a repo-local ledger at `artifacts/memory_ledger/bridge_apollo_replay.json` by default and emits a memory-ledger report with:
+
+- before/after tier counts
+- applied `warm -> cold` transitions
+- recent tier changes
+- low-utility tail
+- reporting-only archive/prune suggestions
 
 ## Interpreting Results
 
@@ -280,19 +286,22 @@ The current benchmark evidence supports this decomposition:
 - quality depends heavily on the selected model and embedding behavior
 - true hidden-state injection is currently implemented only for a narrow GPT-2-class phase 2A verification path
 - compact replay is currently a narrow target-token experiment, not yet a general continuation path
-- the memory ledger is currently observability-only; it reports tier suggestions but does not demote, archive, or prune anything yet
+- the memory ledger now supports a conservative reversible lifecycle step: `warm -> cold` can be applied, while `archived` and `pruned` remain reporting-only
+- the current `cold` policy is intentionally narrow and tuned around replay-quality failures rather than generic retrieval participation
+- archive eligibility now depends on repeated weak evidence across persisted runs, but archive action itself is still disabled
 - the bundled GGUF models are local dependencies and are not intended to be committed to git
 
 ## Roadmap
 
 Likely next steps from the current state:
 
-1. Turn the new memory ledger into an actual lifecycle layer with conservative warm/cold/archive transitions.
-2. Stress `token@10/fp16` on harder routed slices before trying smarter lossy replay-token codecs.
-3. Run context-budget ablations such as `4096` vs `8192`.
-4. Broaden the HF trace backend beyond the current verification path and harden resumed-forward agreement checks.
-5. Add next-token continuation after resumed execution.
-6. Compare semantic replay, offline trace reconstruction, and resumed execution on the same cases.
+1. Require a demonstrated recovery/resurgence path before enabling any automatic `cold -> warm` promotions.
+2. Keep `archived` and `pruned` reporting-only until repeated-weakness archive suggestions are validated over more persisted bridge runs.
+3. Stress `token@10/fp16` on harder routed slices before trying smarter lossy replay-token codecs.
+4. Run context-budget ablations such as `4096` vs `8192`.
+5. Broaden the HF trace backend beyond the current verification path and harden resumed-forward agreement checks.
+6. Add next-token continuation after resumed execution.
+7. Compare semantic replay, offline trace reconstruction, and resumed execution on the same cases.
 
 ## License
 

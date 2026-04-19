@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+import json
+from pathlib import Path
 
 
 def utc_now_iso() -> str:
@@ -24,6 +26,10 @@ class MemoryObject:
     downstream_utility: float = 0.0
     replay_usage_count: int = 0
     jump_score: float = 0.0
+    weak_evidence_count: int = 0
+    consecutive_weak_runs: int = 0
+    resurgence_count: int = 0
+    last_strong_recovery_at: str | None = None
     last_token_agreement: float | None = None
     last_topk_full_rate: float | None = None
     last_first_divergence_step: int | None = None
@@ -52,6 +58,60 @@ class MemoryLedger:
     def __init__(self) -> None:
         self.objects: dict[str, MemoryObject] = {}
         self.tier_changes: list[TierChange] = []
+
+    @classmethod
+    def load(cls, path: str | Path) -> MemoryLedger:
+        ledger = cls()
+        file_path = Path(path)
+        if not file_path.exists():
+            return ledger
+        payload = json.loads(file_path.read_text(encoding="utf-8"))
+        for object_row in payload.get("objects", []):
+            memory_object = MemoryObject(**object_row)
+            ledger.objects[memory_object.object_id] = memory_object
+        for change_row in payload.get("tier_changes", []):
+            ledger.tier_changes.append(TierChange(**change_row))
+        return ledger
+
+    def save(self, path: str | Path) -> None:
+        file_path = Path(path)
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "objects": [asdict(memory_object) for memory_object in self.objects.values()],
+            "tier_changes": [asdict(tier_change) for tier_change in self.tier_changes],
+        }
+        file_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+    def _is_weak_evidence(
+        self,
+        *,
+        token_agreement: float | None,
+        topk_full_rate: float | None,
+        first_divergence_step: int | None,
+        distance_bin: str | None,
+    ) -> bool:
+        safe_token_agreement = token_agreement if token_agreement is not None else 1.0
+        safe_topk_full_rate = topk_full_rate if topk_full_rate is not None else 1.0
+        return (
+            safe_token_agreement < 0.999
+            or first_divergence_step is not None
+            or (distance_bin in {"medium", "far"} and safe_topk_full_rate < 0.90)
+        )
+
+    def _is_strong_recovery(
+        self,
+        *,
+        token_agreement: float | None,
+        topk_full_rate: float | None,
+        first_divergence_step: int | None,
+    ) -> bool:
+        safe_token_agreement = token_agreement if token_agreement is not None else 1.0
+        safe_topk_full_rate = topk_full_rate if topk_full_rate is not None else 1.0
+        return (
+            safe_token_agreement >= 0.999
+            and safe_topk_full_rate >= 0.99
+            and first_divergence_step is None
+        )
 
     def register_event(
         self,
@@ -115,6 +175,25 @@ class MemoryLedger:
         memory_object.last_first_divergence_step = first_divergence_step
         memory_object.last_steps_completed = steps_completed
         memory_object.last_distance_bin = distance_bin
+        weak_evidence = self._is_weak_evidence(
+            token_agreement=token_agreement,
+            topk_full_rate=topk_full_rate,
+            first_divergence_step=first_divergence_step,
+            distance_bin=distance_bin,
+        )
+        strong_recovery = self._is_strong_recovery(
+            token_agreement=token_agreement,
+            topk_full_rate=topk_full_rate,
+            first_divergence_step=first_divergence_step,
+        )
+        if weak_evidence:
+            memory_object.weak_evidence_count += 1
+            memory_object.consecutive_weak_runs += 1
+        else:
+            if strong_recovery and memory_object.consecutive_weak_runs > 0:
+                memory_object.resurgence_count += 1
+                memory_object.last_strong_recovery_at = timestamp
+            memory_object.consecutive_weak_runs = 0
         if behavior_helped:
             memory_object.downstream_utility += behavior_score if behavior_score is not None else 1.0
             memory_object.last_useful_at = timestamp
@@ -195,19 +274,25 @@ class MemoryLedger:
             reasons.append("stale usefulness")
             confidence += 0.05
 
+        strong_continuation_weakness = token_agreement < 0.999 or first_divergence_step is not None
+        harder_bucket_ranking_weakness = (
+            distance_bin in {"medium", "far"} and topk_full_rate < 0.90
+        )
+
         if (
             memory_object.tier == "warm"
             and (
-                memory_object.downstream_utility < 0.97
-                or token_agreement < 0.999
-                or topk_full_rate < 0.95
-                or first_divergence_step is not None
+                strong_continuation_weakness
+                or harder_bucket_ranking_weakness
             )
         ):
             suggested_tier = "cold"
 
         if (
-            memory_object.tier in {"warm", "cold"}
+            memory_object.tier == "cold"
+            and memory_object.weak_evidence_count >= 2
+            and memory_object.consecutive_weak_runs >= 2
+            and memory_object.resurgence_count == 0
             and (
                 memory_object.downstream_utility < 0.90
                 or (distance_bin in {"medium", "far"} and (token_agreement < 0.95 or topk_full_rate < 0.85))
@@ -230,6 +315,10 @@ class MemoryLedger:
             "topk_frequency": memory_object.topk_frequency,
             "downstream_utility": memory_object.downstream_utility,
             "jump_score": memory_object.jump_score,
+            "weak_evidence_count": memory_object.weak_evidence_count,
+            "consecutive_weak_runs": memory_object.consecutive_weak_runs,
+            "resurgence_count": memory_object.resurgence_count,
+            "last_strong_recovery_at": memory_object.last_strong_recovery_at,
             "last_useful_at": memory_object.last_useful_at,
             "token_agreement": token_agreement,
             "topk_full_rate": topk_full_rate,
@@ -288,6 +377,8 @@ class MemoryLedger:
                     "token_agreement": suggestion["token_agreement"],
                     "topk_full_rate": suggestion["topk_full_rate"],
                     "distance_bin": suggestion["distance_bin"],
+                    "consecutive_weak_runs": suggestion["consecutive_weak_runs"],
+                    "resurgence_count": suggestion["resurgence_count"],
                     "changed_at": self.tier_changes[-1].changed_at,
                 }
             )
@@ -323,6 +414,10 @@ class MemoryLedger:
                     "downstream_utility": memory_object.downstream_utility,
                     "topk_frequency": memory_object.topk_frequency,
                     "replay_usage_count": memory_object.replay_usage_count,
+                    "weak_evidence_count": memory_object.weak_evidence_count,
+                    "consecutive_weak_runs": memory_object.consecutive_weak_runs,
+                    "resurgence_count": memory_object.resurgence_count,
+                    "last_strong_recovery_at": memory_object.last_strong_recovery_at,
                     "last_useful_at": memory_object.last_useful_at,
                     "token_agreement": memory_object.last_token_agreement,
                     "topk_full_rate": memory_object.last_topk_full_rate,

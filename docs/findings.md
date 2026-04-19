@@ -1240,3 +1240,67 @@ What this means:
 - the first reversible lifecycle action is behaving safely at the object-family level: only the known loser family moved
 - but it is already a little aggressive within that family, because it cools some `int8` cases that still preserve token agreement and only lose ranking stability
 - that is acceptable for a reversible `cold` tier, but it is a real calibration signal before any stronger lifecycle action is enabled
+
+Refined cold calibration:
+
+- the `cold` rule was then narrowed so ranking-only softness is not enough by itself in easy conditions
+- the refined policy now treats `cold` as:
+  - real continuation weakness (`token drift` or `divergence`)
+  - or ranking weakness in harder buckets (`medium` / `far`)
+- near-bucket ranking softness alone no longer triggers `cold`
+
+Hard lifecycle rerun after calibration:
+
+- reran the same harder bridge cut again:
+  - cases: `24`
+  - routed top-1 hits: `18`
+  - replay horizon: `20`
+- replay behavior remained unchanged:
+  - `text@window`, exact replay token, full late band, and `fp16` remained clean
+  - `int8` remained the repeated loser
+
+Tier effects after refinement:
+
+- before:
+  - `warm = 90`
+  - `cold = 0`
+- after:
+  - `warm = 89`
+  - `cold = 1`
+
+Interpretation:
+
+- the first mutable tier is now more conservative in the right way
+- only one `int8` object, a far-bucket ranking-weak case, was actually cooled
+- near-only ranking softness no longer gets auto-cooled
+- archive suggestions still capture the more severe `int8` failures, but remain non-mutating
+
+Persistence across runs:
+
+- the bridge now persists its ledger state in a repo-local JSON file:
+  - `artifacts/memory_ledger/bridge_apollo_replay.json`
+- that makes weak-evidence counts, consecutive weak runs, and resurgence tracking meaningful across repeated bridge executions instead of resetting every time
+
+Second persisted bridge run:
+
+- reran the same harder bridge cut against the persisted ledger
+- replay metrics stayed unchanged again:
+  - `text@window`, exact replay token, full late band, and `fp16` remained clean
+  - `int8` remained the repeated loser
+
+What persistence changed:
+
+- no new `warm -> cold` transitions were applied on the second persisted run
+- the existing `cold` set remained stable:
+  - before: `warm = 85`, `cold = 5`
+  - after: `warm = 85`, `cold = 5`
+- several of those existing cold `int8` objects now became archive-eligible in reporting:
+  - repeated weak evidence count reached `2`
+  - consecutive weak runs reached `2`
+  - no resurgence was observed
+
+Interpretation:
+
+- the lifecycle policy now has real inertia across runs instead of twitching on a single weak outing
+- `cold` remains reversible and conservative
+- `archived` is now backed by repeated persisted weakness rather than one-off suggestion noise, while still remaining non-mutating

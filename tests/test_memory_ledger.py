@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+import tempfile
 import unittest
 
 from residual_stream_lab.memory_ledger import MemoryLedger
@@ -67,7 +69,7 @@ class MemoryLedgerTests(unittest.TestCase):
         candidates = ledger.candidate_rows()
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0]["object_id"], "case-2:token@10/int8")
-        self.assertEqual(candidates[0]["suggested_tier"], "archived")
+        self.assertEqual(candidates[0]["suggested_tier"], "cold")
         self.assertLess(candidates[0]["downstream_utility"], 0.9)
         self.assertIn("token drift", candidates[0]["suggested_reason"])
         self.assertIn("medium-bucket failure", candidates[0]["suggested_reason"])
@@ -94,6 +96,7 @@ class MemoryLedgerTests(unittest.TestCase):
             steps_completed=10,
             distance_bin="far",
         )
+        ledger.report(apply_cold_transitions=True)
         ledger.register_event(
             object_id="case-4:token@10/int8",
             kind="token@10/int8",
@@ -118,6 +121,7 @@ class MemoryLedgerTests(unittest.TestCase):
         self.assertEqual(candidates[0]["suggested_tier"], "archived")
         self.assertIn("no meaningful jump", candidates[0]["suggested_reason"])
         self.assertIn("far-bucket failure", candidates[0]["suggested_reason"])
+        self.assertEqual(candidates[0]["consecutive_weak_runs"], 2)
 
     def test_report_contains_expected_sections(self) -> None:
         ledger = MemoryLedger()
@@ -165,10 +169,10 @@ class MemoryLedgerTests(unittest.TestCase):
             behavior_helped=False,
             behavior_score=0.93,
             token_agreement=1.0,
-            topk_full_rate=0.75,
+            topk_full_rate=0.88,
             first_divergence_step=None,
             steps_completed=10,
-            distance_bin="near",
+            distance_bin="medium",
         )
 
         report = ledger.report(apply_cold_transitions=True)
@@ -177,7 +181,33 @@ class MemoryLedgerTests(unittest.TestCase):
         self.assertEqual(len(report["applied_transitions"]), 1)
         self.assertEqual(report["applied_transitions"][0]["new_tier"], "cold")
 
-    def test_apply_cold_transitions_does_not_apply_archived_suggestions(self) -> None:
+    def test_near_bucket_ranking_softness_stays_warm(self) -> None:
+        ledger = MemoryLedger()
+        ledger.register_event(
+            object_id="case-7:token@10/int8",
+            kind="token@10/int8",
+            bytes=772,
+            source_case_id="case-7",
+            source_region_id="case-7:window:4",
+            rank=2,
+            retrieved=True,
+            entered_topk=True,
+            reinjected=True,
+            behavior_helped=False,
+            behavior_score=0.93,
+            token_agreement=1.0,
+            topk_full_rate=0.75,
+            first_divergence_step=None,
+            steps_completed=10,
+            distance_bin="near",
+        )
+
+        report = ledger.report(apply_cold_transitions=True)
+        self.assertEqual(report["tier_counts_after"]["warm"], 1)
+        self.assertEqual(report["tier_counts_after"]["cold"], 0)
+        self.assertEqual(len(report["applied_transitions"]), 0)
+
+    def test_first_severe_failure_still_goes_to_cold_before_archive(self) -> None:
         ledger = MemoryLedger()
         ledger.register_event(
             object_id="case-6:token@10/int8",
@@ -199,9 +229,40 @@ class MemoryLedgerTests(unittest.TestCase):
         )
 
         report = ledger.report(apply_cold_transitions=True)
-        self.assertEqual(report["tier_counts_after"]["warm"], 1)
-        self.assertEqual(report["tier_counts_after"]["cold"], 0)
-        self.assertEqual(len(report["applied_transitions"]), 0)
+        self.assertEqual(report["tier_counts_after"]["warm"], 0)
+        self.assertEqual(report["tier_counts_after"]["cold"], 1)
+        self.assertEqual(len(report["applied_transitions"]), 1)
+
+    def test_persistence_round_trip_preserves_run_history(self) -> None:
+        ledger = MemoryLedger()
+        ledger.register_event(
+            object_id="case-8:token@10/int8",
+            kind="token@10/int8",
+            bytes=772,
+            source_case_id="case-8",
+            source_region_id="case-8:window:9",
+            rank=3,
+            retrieved=True,
+            entered_topk=False,
+            reinjected=True,
+            behavior_helped=False,
+            behavior_score=0.78,
+            token_agreement=0.83,
+            topk_full_rate=0.78,
+            first_divergence_step=4,
+            steps_completed=10,
+            distance_bin="medium",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "ledger.json"
+            ledger.save(path)
+            loaded = MemoryLedger.load(path)
+
+        memory_object = loaded.objects["case-8:token@10/int8"]
+        self.assertEqual(memory_object.weak_evidence_count, 1)
+        self.assertEqual(memory_object.consecutive_weak_runs, 1)
+        self.assertEqual(memory_object.last_distance_bin, "medium")
 
 
 if __name__ == "__main__":

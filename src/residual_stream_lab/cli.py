@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from pathlib import Path
 import re
 from time import perf_counter
 
@@ -602,6 +603,7 @@ def evaluate_routed_replay_bridge(
     cases: list[ApolloCase],
     routing_runner: GGUFRunner,
     replay_runner: HFTraceRunner,
+    ledger: MemoryLedger | None = None,
     recent_windows: int,
     top_k: int,
     replay_boundary_layer: int,
@@ -610,7 +612,8 @@ def evaluate_routed_replay_bridge(
     rerank_strategy: str = "staged",
     replay_top_k: int = 5,
 ) -> dict[str, object]:
-    ledger = MemoryLedger()
+    if ledger is None:
+        ledger = MemoryLedger()
     object_order = [
         "text@window",
         f"token@{replay_layer}",
@@ -1983,6 +1986,10 @@ def bridge_apollo_replay(
     replay_top_k: int = typer.Option(5, min=1, help="Top-k width used for replay ranking stability."),
     hf_device: str = typer.Option("cpu", help="Torch device for the HF replay backend."),
     hf_dtype: str = typer.Option("auto", help="Torch dtype: auto, float32, float16, or bfloat16."),
+    ledger_path: str = typer.Option(
+        "artifacts/memory_ledger/bridge_apollo_replay.json",
+        help="Repo-local JSON file used to persist bridge memory-ledger state across runs.",
+    ),
 ) -> None:
     routing_runner = GGUFRunner(model_path=model_path, n_ctx=n_ctx)
     replay_runner = HFTraceRunner(
@@ -1990,6 +1997,7 @@ def bridge_apollo_replay(
         device=hf_device,
         dtype=hf_dtype,
     )
+    persisted_ledger = MemoryLedger.load(Path(ledger_path))
     cases = build_apollo_cases(
         corpus_path=corpus_path,
         case_count=case_count,
@@ -2002,6 +2010,7 @@ def bridge_apollo_replay(
         cases=cases,
         routing_runner=routing_runner,
         replay_runner=replay_runner,
+        ledger=persisted_ledger,
         recent_windows=recent_windows,
         top_k=top_k,
         replay_boundary_layer=replay_boundary_layer,
@@ -2010,6 +2019,7 @@ def bridge_apollo_replay(
         rerank_strategy="staged",
         replay_top_k=replay_top_k,
     )
+    persisted_ledger.save(Path(ledger_path))
 
     console.print(
         "[bold]Apollo Routed Replay Bridge[/bold]\n"
@@ -2095,6 +2105,7 @@ def bridge_apollo_replay(
         applied_table.add_column("Token Agr.")
         applied_table.add_column("Top-5 Full")
         applied_table.add_column("Bucket")
+        applied_table.add_column("Weak Runs")
         applied_table.add_column("Reason")
         for row in applied_transitions:
             applied_table.add_row(
@@ -2106,6 +2117,7 @@ def bridge_apollo_replay(
                 f"{row['token_agreement']:.2f}",
                 f"{row['topk_full_rate']:.2f}",
                 str(row["distance_bin"] or "-"),
+                str(row["consecutive_weak_runs"]),
                 str(row["suggested_reason"]),
             )
         console.print(applied_table)
@@ -2140,6 +2152,8 @@ def bridge_apollo_replay(
         low_utility_table.add_column("Token Agr.")
         low_utility_table.add_column("Top-5 Full")
         low_utility_table.add_column("Bucket")
+        low_utility_table.add_column("Weak Runs")
+        low_utility_table.add_column("Resurge")
         low_utility_table.add_column("Top-K Freq")
         low_utility_table.add_column("Replay Uses")
         for row in low_utility_tail:
@@ -2151,6 +2165,8 @@ def bridge_apollo_replay(
                 f"{(row['token_agreement'] if row['token_agreement'] is not None else 0.0):.2f}",
                 f"{(row['topk_full_rate'] if row['topk_full_rate'] is not None else 0.0):.2f}",
                 str(row["distance_bin"] or "-"),
+                str(row["consecutive_weak_runs"]),
+                str(row["resurgence_count"]),
                 f"{row['topk_frequency']:.2f}",
                 str(row["replay_usage_count"]),
             )
@@ -2168,6 +2184,8 @@ def bridge_apollo_replay(
         archive_table.add_column("Token Agr.")
         archive_table.add_column("Top-5 Full")
         archive_table.add_column("Bucket")
+        archive_table.add_column("Weak Runs")
+        archive_table.add_column("Resurge")
         archive_table.add_column("Replay Uses")
         archive_table.add_column("Top-K Freq")
         archive_table.add_column("Reason")
@@ -2182,6 +2200,8 @@ def bridge_apollo_replay(
                 f"{row['token_agreement']:.2f}",
                 f"{row['topk_full_rate']:.2f}",
                 str(row["distance_bin"] or "-"),
+                str(row["consecutive_weak_runs"]),
+                str(row["resurgence_count"]),
                 str(row["replay_usage_count"]),
                 f"{row['topk_frequency']:.2f}",
                 str(row["suggested_reason"]),
