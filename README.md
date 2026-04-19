@@ -235,6 +235,19 @@ Gemma 4 2B is also supported on the HF text path:
   --dtype float16
 ```
 
+For long-context Gemma probes on this machine, the better split is currently:
+
+- CPU for orchestration, routing, bookkeeping, and reporting
+- `mps` for the heavy Gemma model pass
+
+In a repo-local `8192`-token needle-in-the-haystack check with `models/google--gemma-4-E2B-it`, Gemma on `mps` returned the correct first answer token (`" teal"`) with:
+
+- model load: about `45.9s`
+- `8k` prefill: about `33.8s`
+- total one-shot wall time: about `87.9s`
+
+The same control-heavy replay bridge harness did not benefit from moving wholesale to `mps`; for Gemma bridge work, keep the harness on CPU unless a narrower model-only path proves otherwise.
+
 Probe compact replay objects against the exact replay baseline:
 
 ```bash
@@ -298,6 +311,12 @@ The current benchmark evidence supports this decomposition:
 - local expansion helps on harder cases, especially the medium-distance bucket
 - the remaining gap is now mostly replay sufficiency / model use after correct retrieval
 
+Operational note for Gemma:
+
+- long forward / prefill is the part most likely to benefit from acceleration
+- control-heavy bridge orchestration may still run worse on `mps` than on CPU
+- treat `cpu` vs `mps` as a measured split, not a default assumption
+
 ## Current Limitations
 
 - checkpoint replay is a text-memory proxy, not exact residual-state replay
@@ -305,6 +324,7 @@ The current benchmark evidence supports this decomposition:
 - quality depends heavily on the selected model and embedding behavior
 - true hidden-state injection is currently implemented only for the narrow HF verification path exercised so far (currently GPT-2-class and Gemma 4 text-only prompts)
 - compact replay is currently a narrow target-token experiment, not yet a general continuation path
+- routed Gemma replay now reaches the bridge correctly, but broad Gemma bridge sweeps remain expensive in the current generic harness; use CPU orchestration plus targeted `mps` model passes for large-context probes
 - the memory ledger now supports a conservative reversible lifecycle step: `warm -> cold` can be applied, while `archived` and `pruned` remain reporting-only
 - the current `cold` policy is intentionally narrow and tuned around replay-quality failures rather than generic retrieval participation
 - archive eligibility now depends on repeated weak evidence across persisted runs, but archive action itself is still disabled

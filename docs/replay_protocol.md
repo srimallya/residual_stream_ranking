@@ -180,6 +180,14 @@ This is the main portability lesson:
 
 Do not port by deleting guards. Port by rebuilding the model's actual resume contract.
 
+Operational note:
+
+- do not assume `mps` or another accelerator will help the whole harness uniformly
+- for Gemma on this machine, the useful split is currently:
+  - CPU for orchestration and control-heavy evaluation
+  - `mps` for dense long-context model passes
+- measure long prefill separately from harness overhead
+
 ## Compact Replay Strategy
 
 The repo now has evidence for several object families.
@@ -337,6 +345,7 @@ As of the current repo state:
 - Gemma 4 2B HF replay is exact through phase 2C
 - routed replay with GPT-2 is discriminative enough to separate strong compact objects from lossy ones
 - routed Gemma replay reaches the bridge correctly, but the current generic CPU harness is expensive enough that broader Gemma bridge sweeps need a lighter evaluation path
+- Gemma on `mps` is viable for `8k`-token needle-style long-context prefill, while the surrounding bridge/orchestration work still fits CPU better on this machine
 
 See also:
 

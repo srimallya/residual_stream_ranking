@@ -1414,3 +1414,30 @@ Gemma routed bridge probe:
 - operational constraint:
   - even this minimal routed Gemma probe took about `81.8s` on CPU
   - so Gemma replay correctness now reaches into the routed bridge, but the current generic bridge harness is too expensive on CPU for broad Gemma sweeps without a lighter evaluation path or better model residency/caching
+
+Gemma 8k long-context MPS probe:
+
+- objective:
+  - keep orchestration on CPU
+  - move only the heavy Gemma model pass to `mps`
+  - test an actual `8192`-token needle-in-the-haystack prompt
+- setup:
+  - model: `models/google--gemma-4-E2B-it`
+  - prompt length: `8192` tokens
+  - inserted fact:
+    - `Archive case SPEED-8000 marker color is teal.`
+  - question:
+    - `What is the marker color for case SPEED-8000? Answer with one color token only.`
+- observed `mps` result:
+  - model load: `45.87s`
+  - `8k` prefill: `33.82s`
+  - total one-shot wall time: `87.87s`
+  - first predicted token: `" teal"`
+  - correctness: yes
+- interpretation:
+  - Gemma on `mps` is viable for large single-pass long-context prefill on this machine
+  - the useful accelerated unit is the dense model pass, not the full replay harness
+  - broad control-heavy bridge evaluation still should not be assumed to benefit from `mps`
+  - current practical split is:
+    - CPU for orchestration, routing, bookkeeping, and reporting
+    - `mps` for heavy long-context Gemma forward / prefill when the prompt is large enough to amortize overhead
