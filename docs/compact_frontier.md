@@ -25,6 +25,8 @@ Prompt families used so far:
 - factual-simple: `"The capital of France is"`
 - factual-compositional: `"The capital of France is Paris and the capital of Japan is"`
 - narrative: `"Alice opened the red door and found a small brass key that"`
+- procedural / instruction-like: `"To boil an egg, first fill a pot with water and"`
+- code-like completion: `"def add_numbers(a, b):\n    return"`
 
 ## Frontier Table
 
@@ -42,6 +44,14 @@ Prompt families used so far:
 | `depth 2` (`9,10`) | narrative | greedy match, `5/5` top-k | `0.70` | `6` | `4/10` | One-step flattering, continuation-unsafe |
 | `depth 3` (`8,9,10`) | narrative | greedy mismatch, `5/5` top-k | `0.10` | `1` | `1/10` | Warning case |
 | `depth 4` (`7,8,9,10`) | narrative | greedy match, `5/5` top-k | `1.00` | none | `10/10` | Safe on tested horizon |
+| `depth 0` | procedural / instruction-like | greedy mismatch, `1/5` top-k | `0.20` | `1` | `0/10` | Too thin |
+| `depth 2` (`9,10`) | procedural / instruction-like | greedy match, `5/5` top-k | `0.20` | `3` | `2/10` | One-step flattering, continuation-unsafe |
+| `depth 3` (`8,9,10`) | procedural / instruction-like | greedy match, `4/5` top-k | `0.90` | `10` | `6/10` | Strong but still not safe |
+| `depth 4` (`7,8,9,10`) | procedural / instruction-like | greedy match, `5/5` top-k | `1.00` | none | `10/10` | Safe on tested horizon |
+| `depth 0` | code-like completion | greedy mismatch, `2/5` top-k | `0.00` | `1` | `0/10` | Too thin |
+| `depth 2` (`9,10`) | code-like completion | greedy match, `4/5` top-k | `1.00` | none | `3/10` | Tokens stable, ranking not stable |
+| `depth 3` (`8,9,10`) | code-like completion | greedy match, `5/5` top-k | `1.00` | none | `4/10` | Tokens stable, ranking not stable |
+| `depth 4` (`7,8,9,10`) | code-like completion | greedy match, `5/5` top-k | `1.00` | none | `10/10` | Safe on tested horizon |
 
 ## What The Table Means
 
@@ -50,6 +60,9 @@ Prompt families used so far:
 - The frontier is non-smooth:
   - `depth 3` looks strong on the two factual prompts
   - the same object fails badly on the narrative prompt
+- Prompt family matters:
+  - procedural continuation punishes `depth 2` much harder than its one-step result suggests
+  - code-like continuation allows thinner objects to preserve tokens while still losing ranking stability
 - The current safe compact object is the full local late band:
   - boundary layer `6`
   - replay layer `10`
@@ -58,6 +71,54 @@ Prompt families used so far:
 ## Current Claim
 
 Reduced replay objects can preserve one-step behavior without preserving iterative continuation. On the tested set, the full local late-band object is the only continuation-faithful compact replay object so far.
+
+## Horizon Extension: 20-Step Check
+
+The same fixed prompt-family panel and the same compact objects were then extended from `10` to `20` greedy steps.
+
+This does not change the frontier qualitatively. It sharpens it.
+
+| Object Kept | Prompt Family | Token Agreement / 20 | First Divergence Step | Top-5 Full-Overlap Steps | Current Read |
+| --- | --- | ---: | ---: | ---: | --- |
+| `depth 0` | factual-simple | `0.05` | `2` | `0/20` | Too thin |
+| `depth 2` (`9,10`) | factual-simple | `0.35` | `7` | `4/20` | Degrades early |
+| `depth 3` (`8,9,10`) | factual-simple | `1.00` | none | `11/20` | Tokens stable, ranking decays |
+| `depth 4` (`7,8,9,10`) | factual-simple | `1.00` | none | `20/20` | Safe on tested horizon |
+| `depth 0` | factual-compositional | `0.30` | `1` | `0/20` | Too thin |
+| `depth 2` (`9,10`) | factual-compositional | `0.45` | `9` | `3/20` | Degrades early |
+| `depth 3` (`8,9,10`) | factual-compositional | `0.60` | `13` | `8/20` | Not continuation-safe |
+| `depth 4` (`7,8,9,10`) | factual-compositional | `1.00` | none | `20/20` | Safe on tested horizon |
+| `depth 0` | narrative | `0.00` | `1` | `0/20` | Too thin |
+| `depth 2` (`9,10`) | narrative | `0.35` | `6` | `5/20` | One-step flattering, continuation-unsafe |
+| `depth 3` (`8,9,10`) | narrative | `0.05` | `1` | `1/20` | Warning case |
+| `depth 4` (`7,8,9,10`) | narrative | `1.00` | none | `20/20` | Safe on tested horizon |
+| `depth 0` | procedural / instruction-like | `0.15` | `1` | `0/20` | Too thin |
+| `depth 2` (`9,10`) | procedural / instruction-like | `0.10` | `3` | `2/20` | One-step flattering, continuation-unsafe |
+| `depth 3` (`8,9,10`) | procedural / instruction-like | `0.50` | `10` | `6/20` | Stronger, still unstable |
+| `depth 4` (`7,8,9,10`) | procedural / instruction-like | `1.00` | none | `20/20` | Safe on tested horizon |
+| `depth 0` | code-like completion | `0.05` | `1` | `0/20` | Too thin |
+| `depth 2` (`9,10`) | code-like completion | `0.85` | `18` | `6/20` | Tokens persist, ranking weak |
+| `depth 3` (`8,9,10`) | code-like completion | `1.00` | none | `11/20` | Tokens stable, ranking decays |
+| `depth 4` (`7,8,9,10`) | code-like completion | `1.00` | none | `20/20` | Safe on tested horizon |
+
+### What The 20-Step Extension Adds
+
+- The full local band still holds across the entire fixed prompt-family panel.
+- Thinner objects keep decaying with prompt-family-specific shapes rather than converging to one simple failure mode.
+- `depth 3` is now clearly not safe in general:
+  - it survives the simple factual and code-like prompts at the token level
+  - it degrades on factual-compositional prompts
+  - it fails badly on the narrative prompt
+  - it is only moderately stable on the procedural prompt
+- `depth 2` remains continuation-unsafe everywhere, even when it looks deceptively good on one-step checks or on code-like token agreement.
+
+### Updated Safe Object
+
+On the current GPT-2 compact frontier, the only continuation-safe reduced replay object on the tested panel through `20` steps is still:
+
+- boundary layer `6`
+- replay layer `10`
+- full local late band `7,8,9,10`
 
 ## Next Widening
 

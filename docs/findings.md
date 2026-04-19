@@ -791,3 +791,27 @@ Canonical artifact:
 - the compact branch now has a dedicated frontier table in `docs/compact_frontier.md`
 - that table keeps one-step status separate from continuation stability
 - it should be treated as the main evidence surface for compact replay, rather than scattered narrative summaries
+
+Prompt-family widening:
+
+- the compact frontier has now been widened beyond factual and narrative prompts to include:
+  - procedural / instruction-like continuation
+  - code-like completion
+- the main conclusion still holds:
+  - the full late-band object remains the only continuation-safe compact replay object on the tested set
+- the new rows sharpen the failure pattern:
+  - procedural prompts show that a one-step-perfect reduced object can still collapse early in continuation
+  - code-like prompts show that thinner objects can preserve token agreement while still losing ranking stability
+
+Horizon extension:
+
+- the fixed prompt-family panel has now also been extended from `10` to `20` greedy steps at the same compact cut:
+  - boundary layer `6`
+  - replay layer `10`
+  - compact objects `0 / 2 / 3 / 4`
+- the central conclusion survives intact:
+  - the full late-band object `7,8,9,10` remains the only continuation-safe compact replay object on the tested panel
+- the 20-step extension makes the prompt-family dependence clearer:
+  - `depth 3` is no longer plausibly safe in general
+  - `depth 2` remains continuation-unsafe everywhere
+  - code-like prompts still allow token agreement to survive longer than ranking stability
