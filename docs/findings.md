@@ -891,6 +891,7 @@ Routing -> replay bridge:
   - staged routing top-1 hit rate: `0.67`
   - staged routing top-k hit rate: `1.00`
 - on the two routed hits in that slice, the tracked replay objects all remained clean over the tested `10`-step horizon:
+  - `text@window` control
   - `token@10`
   - `token@10/fp16`
   - `token@10/int8`
@@ -900,4 +901,5 @@ Current bridge read:
 
 - the project now has an actual routing -> replay architecture path, not just two disconnected sub-results
 - the first bridge validation is small, but it shows the intended stack is executable end to end
+- the bridge surface now includes a plain text control, so tracked replay objects can be compared against ordinary routed text on the same hit slice
 - the next bridge question is no longer "can we connect them?" but "which replay object wins once the routed hit slice gets larger and harder?"

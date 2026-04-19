@@ -610,6 +610,7 @@ def evaluate_routed_replay_bridge(
     replay_top_k: int = 5,
 ) -> dict[str, object]:
     object_order = [
+        "text@window",
         f"token@{replay_layer}",
         f"token@{replay_layer}/fp16",
         f"token@{replay_layer}/int8",
@@ -675,6 +676,14 @@ def evaluate_routed_replay_bridge(
                 row["object_label"]: row
                 for row in replay_result["rows"]
                 if row["object_label"] in object_order
+            }
+            replay_rows["text@window"] = {
+                "object_label": "text@window",
+                "compact_bytes": len(routed_window_text.encode("utf-8")),
+                "token_agreement": 1.0,
+                "topk_full_steps": replay_steps,
+                "steps_completed": replay_steps,
+                "first_divergence_step": None,
             }
             case_row["replay"] = replay_rows
             for label in object_order:
