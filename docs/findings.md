@@ -1135,3 +1135,108 @@ Current value of the ledger:
 - the repo now has the protocol substrate for bounded live cognition plus routed autobiographical recall
 - replay selection and replay quality can be observed as memory-object behavior, not just benchmark rows
 - policy can now be added later without first rebuilding the data model or the bridge instrumentation
+
+Harder recommendation-layer cut:
+
+- the reporting-only recommendation layer was then run on the harder discriminative bridge cut:
+  - cases: `24`
+  - routed top-1 hits: `18`
+  - replay horizon: `20`
+- this was the right policy pressure test because the bridge already has a known loser on this slice:
+  - `text@window`, exact replay token, full late band, and `fp16` remain behaviorally clean
+  - `int8` remains the first repeated loser across the medium and far buckets
+
+Observed ledger behavior on the harder cut:
+
+- the low-utility tail populated with failing `token@10/int8` objects exactly as expected
+- the suggestion table stayed empty
+- no safe-group objects were falsely suggested for demotion or archive
+
+What this means:
+
+- the ledger substrate is working: it can already distinguish the weak replay-object tail from the safe group
+- the current recommendation policy is too conservative for the present bridge instrumentation
+- specifically, every replay object is currently recorded as entering the routed top-k by construction on top-1 hit cases, so `topk_frequency` does not yet help separate weak replay objects from strong ones
+
+Updated policy read:
+
+- reporting-only recommendations are behaving safely, but not yet informatively enough to drive tier suggestions on the harder bridge slice
+- the next calibration step is to refine the recommendation signal so it keys more directly off replay-object behavior quality, not just routed-hit participation
+
+Replay-quality-calibrated recommendation layer:
+
+- the recommendation layer was then recalibrated to score replay objects directly on continuation behavior instead of leaning on routed-hit participation
+- the key added signals were:
+  - token agreement over horizon
+  - top-k full-overlap rate
+  - divergence presence and step
+  - bucket-aware penalties for medium / far failures
+- this kept routed selection as the gate and replay quality as the value signal
+
+Harder policy rerun after recalibration:
+
+- reran the same harder bridge cut:
+  - cases: `24`
+  - routed top-1 hits: `18`
+  - replay horizon: `20`
+- replay behavior itself stayed unchanged:
+  - `text@window`, exact replay token, full late band, and `fp16` remained in the safe group
+  - `int8` remained the repeated loser
+
+What changed in the ledger:
+
+- the `Tier Transition Suggestions` table now populated
+- all populated suggestions were `token@10/int8` objects
+- no safe-group objects were falsely suggested
+- the weaker `int8` cases now split into:
+  - `archived` suggestions for the worst medium / far failures
+  - `cold` suggestions for softer ranking-only failures
+
+Interpretation:
+
+- the recommendation layer is now finally aligned with the bridge’s known weak tail
+- the policy remains reporting-only, but it has crossed from "safe but silent" to "informative and plausibly calibrated"
+- the next lifecycle step can now be conservative tier transitions, because the scoring is no longer blind to replay-object quality
+
+First reversible lifecycle action:
+
+- enabled `warm -> cold` transitions only
+- `archived` and `pruned` remained reporting-only
+- the action stayed conservative:
+  - only `cold` suggestions were eligible
+  - pinned objects remained ineligible
+  - every applied transition was logged with confidence, metrics, bucket, reason, and timestamp
+
+Hard lifecycle run:
+
+- reran the same harder bridge cut:
+  - cases: `24`
+  - routed top-1 hits: `18`
+  - replay horizon: `20`
+- replay behavior itself remained unchanged:
+  - `text@window`, exact replay token, full late band, and `fp16` remained clean
+  - `int8` remained the repeated loser
+
+Tier effects:
+
+- before:
+  - `warm = 90`
+  - `cold = 0`
+- after:
+  - `warm = 83`
+  - `cold = 7`
+- `archived` remained `0` because archive transitions were still reporting-only
+
+What actually moved:
+
+- all applied transitions were `token@10/int8` objects
+- no safe-group objects were moved
+- the applied cold set was dominated by ranking-softness cases, including:
+  - near-bucket cases with token agreement still at `1.00` but degraded top-k stability
+  - medium/far cases with stronger ranking loss
+
+What this means:
+
+- the first reversible lifecycle action is behaving safely at the object-family level: only the known loser family moved
+- but it is already a little aggressive within that family, because it cools some `int8` cases that still preserve token agreement and only lose ranking stability
+- that is acceptable for a reversible `cold` tier, but it is a real calibration signal before any stronger lifecycle action is enabled

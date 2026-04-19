@@ -705,6 +705,23 @@ def evaluate_routed_replay_bridge(
             case_row["replay"] = replay_rows
             for label in object_order:
                 row = replay_rows[label]
+                topk_full_rate = int(row["topk_full_steps"]) / max(int(row["steps_completed"]), 1)
+                first_divergence_step = row["first_divergence_step"]
+                survival_score = (
+                    1.0
+                    if first_divergence_step is None
+                    else max(0.0, (int(first_divergence_step) - 1) / max(int(row["steps_completed"]), 1))
+                )
+                behavior_score = (
+                    0.55 * float(row["token_agreement"])
+                    + 0.30 * topk_full_rate
+                    + 0.15 * survival_score
+                )
+                if case.distance_bin == "medium" and float(row["token_agreement"]) < 1.0:
+                    behavior_score -= 0.05
+                if case.distance_bin == "far" and float(row["token_agreement"]) < 1.0:
+                    behavior_score -= 0.08
+                behavior_score = max(0.0, min(behavior_score, 1.0))
                 aggregate = aggregates[label]
                 aggregate["cases"] += 1
                 aggregate["token_agreement_sum"] += float(row["token_agreement"])
@@ -732,10 +749,16 @@ def evaluate_routed_replay_bridge(
                     entered_topk=True,
                     reinjected=True,
                     behavior_helped=(
-                        float(row["token_agreement"]) == 1.0
-                        and int(row["topk_full_steps"]) == int(row["steps_completed"])
-                        and row["first_divergence_step"] is None
+                        behavior_score >= 0.98
                     ),
+                    behavior_score=behavior_score,
+                    token_agreement=float(row["token_agreement"]),
+                    topk_full_rate=topk_full_rate,
+                    first_divergence_step=(
+                        int(first_divergence_step) if first_divergence_step is not None else None
+                    ),
+                    steps_completed=int(row["steps_completed"]),
+                    distance_bin=case.distance_bin,
                     pinned=False,
                 )
 
@@ -785,7 +808,7 @@ def evaluate_routed_replay_bridge(
         "replay_steps": replay_steps,
         "summary_rows": summary_rows,
         "distance_summary": distance_summary,
-        "memory_ledger": ledger.report(),
+        "memory_ledger": ledger.report(apply_cold_transitions=True),
         "per_case": per_case,
     }
 
@@ -2051,10 +2074,43 @@ def bridge_apollo_replay(
 
     tier_table = Table(title="Memory Ledger Tiers")
     tier_table.add_column("Tier")
+    tier_table.add_column("Before")
     tier_table.add_column("Count")
     for tier_name in ["pinned", "warm", "cold", "archived", "pruned"]:
-        tier_table.add_row(tier_name, str(ledger["tier_counts"].get(tier_name, 0)))
+        tier_table.add_row(
+            tier_name,
+            str(ledger["tier_counts_before"].get(tier_name, 0)),
+            str(ledger["tier_counts"].get(tier_name, 0)),
+        )
     console.print(tier_table)
+
+    applied_transitions = ledger["applied_transitions"]
+    if applied_transitions:
+        applied_table = Table(title="Applied Warm -> Cold Transitions")
+        applied_table.add_column("Object")
+        applied_table.add_column("Kind")
+        applied_table.add_column("From")
+        applied_table.add_column("To")
+        applied_table.add_column("Confidence")
+        applied_table.add_column("Token Agr.")
+        applied_table.add_column("Top-5 Full")
+        applied_table.add_column("Bucket")
+        applied_table.add_column("Reason")
+        for row in applied_transitions:
+            applied_table.add_row(
+                str(row["object_id"]),
+                str(row["kind"]),
+                str(row["previous_tier"]),
+                str(row["new_tier"]),
+                f"{row['confidence']:.2f}",
+                f"{row['token_agreement']:.2f}",
+                f"{row['topk_full_rate']:.2f}",
+                str(row["distance_bin"] or "-"),
+                str(row["suggested_reason"]),
+            )
+        console.print(applied_table)
+    else:
+        console.print("[bold]Applied Warm -> Cold Transitions[/bold]\nNone this run.")
 
     recent_changes = ledger["recent_tier_changes"]
     if recent_changes:
@@ -2081,6 +2137,9 @@ def bridge_apollo_replay(
         low_utility_table.add_column("Kind")
         low_utility_table.add_column("Tier")
         low_utility_table.add_column("Utility")
+        low_utility_table.add_column("Token Agr.")
+        low_utility_table.add_column("Top-5 Full")
+        low_utility_table.add_column("Bucket")
         low_utility_table.add_column("Top-K Freq")
         low_utility_table.add_column("Replay Uses")
         for row in low_utility_tail:
@@ -2088,7 +2147,10 @@ def bridge_apollo_replay(
                 str(row["object_id"]),
                 str(row["kind"]),
                 str(row["tier"]),
-                f"{row['downstream_utility']:.0f}",
+                f"{row['downstream_utility']:.2f}",
+                f"{(row['token_agreement'] if row['token_agreement'] is not None else 0.0):.2f}",
+                f"{(row['topk_full_rate'] if row['topk_full_rate'] is not None else 0.0):.2f}",
+                str(row["distance_bin"] or "-"),
                 f"{row['topk_frequency']:.2f}",
                 str(row["replay_usage_count"]),
             )
@@ -2096,23 +2158,33 @@ def bridge_apollo_replay(
 
     archive_candidates = ledger["archive_candidates"]
     if archive_candidates:
-        archive_table = Table(title="Archive / Prune Candidates (Reporting Only)")
+        archive_table = Table(title="Tier Transition Suggestions (Reporting Only)")
         archive_table.add_column("Object")
         archive_table.add_column("Kind")
         archive_table.add_column("Current")
         archive_table.add_column("Suggested")
+        archive_table.add_column("Confidence")
         archive_table.add_column("Utility")
+        archive_table.add_column("Token Agr.")
+        archive_table.add_column("Top-5 Full")
+        archive_table.add_column("Bucket")
         archive_table.add_column("Replay Uses")
         archive_table.add_column("Top-K Freq")
+        archive_table.add_column("Reason")
         for row in archive_candidates:
             archive_table.add_row(
                 str(row["object_id"]),
                 str(row["kind"]),
                 str(row["current_tier"]),
                 str(row["suggested_tier"]),
-                f"{row['downstream_utility']:.0f}",
+                f"{row['confidence']:.2f}",
+                f"{row['downstream_utility']:.2f}",
+                f"{row['token_agreement']:.2f}",
+                f"{row['topk_full_rate']:.2f}",
+                str(row["distance_bin"] or "-"),
                 str(row["replay_usage_count"]),
                 f"{row['topk_frequency']:.2f}",
+                str(row["suggested_reason"]),
             )
         console.print(archive_table)
 
