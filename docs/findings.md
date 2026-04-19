@@ -1304,3 +1304,32 @@ Interpretation:
 - the lifecycle policy now has real inertia across runs instead of twitching on a single weak outing
 - `cold` remains reversible and conservative
 - `archived` is now backed by repeated persisted weakness rather than one-off suggestion noise, while still remaining non-mutating
+
+Recovery suggestion layer:
+
+- added the reverse lifecycle path in reporting only:
+  - strong resurgence is now tracked via:
+    - `strong_recovery_count`
+    - `consecutive_strong_runs`
+    - `last_strong_recovery_at`
+  - `cold -> warm` suggestions require:
+    - strong token agreement
+    - strong top-k stability
+    - no divergence
+    - recovery under `medium` / `far` pressure rather than only easy near hits
+- bridge output now has a dedicated recovery-suggestions table, separate from archive-style transition suggestions
+
+First live recovery check:
+
+- reran a small bridge slice against the persisted ledger
+- no recovery suggestions appeared, which is the correct conservative outcome for the current data:
+  - the existing cold set has not yet shown strong resurgence under meaningful pressure
+  - no false warm-ups were proposed
+
+Current read:
+
+- the protocol now has a symmetric reporting surface:
+  - weak objects can cool
+  - repeated weakness can become archive-eligible in reporting
+  - strong resurgence can become warm-eligible in reporting
+- but only the reversible `warm -> cold` step is still allowed to mutate state

@@ -2172,7 +2172,9 @@ def bridge_apollo_replay(
             )
         console.print(low_utility_table)
 
-    archive_candidates = ledger["archive_candidates"]
+    transition_candidates = ledger["archive_candidates"]
+    archive_candidates = [row for row in transition_candidates if row["suggested_tier"] in {"cold", "archived"}]
+    recovery_candidates = [row for row in transition_candidates if row["suggested_tier"] == "warm"]
     if archive_candidates:
         archive_table = Table(title="Tier Transition Suggestions (Reporting Only)")
         archive_table.add_column("Object")
@@ -2207,6 +2209,37 @@ def bridge_apollo_replay(
                 str(row["suggested_reason"]),
             )
         console.print(archive_table)
+
+    if recovery_candidates:
+        recovery_table = Table(title="Recovery Suggestions (Reporting Only)")
+        recovery_table.add_column("Object")
+        recovery_table.add_column("Kind")
+        recovery_table.add_column("Current")
+        recovery_table.add_column("Suggested")
+        recovery_table.add_column("Confidence")
+        recovery_table.add_column("Token Agr.")
+        recovery_table.add_column("Top-5 Full")
+        recovery_table.add_column("Bucket")
+        recovery_table.add_column("Strong Runs")
+        recovery_table.add_column("Resurge")
+        recovery_table.add_column("Recovered At")
+        recovery_table.add_column("Reason")
+        for row in recovery_candidates:
+            recovery_table.add_row(
+                str(row["object_id"]),
+                str(row["kind"]),
+                str(row["current_tier"]),
+                str(row["suggested_tier"]),
+                f"{row['confidence']:.2f}",
+                f"{row['token_agreement']:.2f}",
+                f"{row['topk_full_rate']:.2f}",
+                str(row["distance_bin"] or "-"),
+                str(row["consecutive_strong_runs"]),
+                str(row["resurgence_count"]),
+                str(row["last_strong_recovery_at"] or "-"),
+                str(row["suggested_reason"]),
+            )
+        console.print(recovery_table)
 
     pinned_objects = ledger["pinned_objects"]
     if pinned_objects:

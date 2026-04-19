@@ -264,6 +264,55 @@ class MemoryLedgerTests(unittest.TestCase):
         self.assertEqual(memory_object.consecutive_weak_runs, 1)
         self.assertEqual(memory_object.last_distance_bin, "medium")
 
+    def test_cold_object_can_surface_warm_recovery_suggestion(self) -> None:
+        ledger = MemoryLedger()
+        ledger.register_event(
+            object_id="case-9:token@10/int8",
+            kind="token@10/int8",
+            bytes=772,
+            source_case_id="case-9",
+            source_region_id="case-9:window:6",
+            rank=4,
+            retrieved=True,
+            entered_topk=False,
+            reinjected=True,
+            behavior_helped=False,
+            behavior_score=0.10,
+            token_agreement=0.10,
+            topk_full_rate=0.05,
+            first_divergence_step=1,
+            steps_completed=10,
+            distance_bin="far",
+        )
+        ledger.report(apply_cold_transitions=True)
+
+        ledger.register_event(
+            object_id="case-9:token@10/int8",
+            kind="token@10/int8",
+            bytes=772,
+            source_case_id="case-9",
+            source_region_id="case-9:window:6",
+            rank=1,
+            retrieved=True,
+            entered_topk=True,
+            reinjected=True,
+            behavior_helped=True,
+            behavior_score=1.0,
+            token_agreement=1.0,
+            topk_full_rate=1.0,
+            first_divergence_step=None,
+            steps_completed=10,
+            distance_bin="far",
+        )
+
+        candidates = ledger.candidate_rows()
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["suggested_tier"], "warm")
+        self.assertEqual(candidates[0]["current_tier"], "cold")
+        self.assertEqual(candidates[0]["consecutive_strong_runs"], 1)
+        self.assertEqual(candidates[0]["resurgence_count"], 1)
+        self.assertIn("strong resurgence", candidates[0]["suggested_reason"])
+
 
 if __name__ == "__main__":
     unittest.main()

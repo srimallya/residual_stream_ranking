@@ -29,6 +29,8 @@ class MemoryObject:
     weak_evidence_count: int = 0
     consecutive_weak_runs: int = 0
     resurgence_count: int = 0
+    strong_recovery_count: int = 0
+    consecutive_strong_runs: int = 0
     last_strong_recovery_at: str | None = None
     last_token_agreement: float | None = None
     last_topk_full_rate: float | None = None
@@ -189,10 +191,17 @@ class MemoryLedger:
         if weak_evidence:
             memory_object.weak_evidence_count += 1
             memory_object.consecutive_weak_runs += 1
+            memory_object.consecutive_strong_runs = 0
         else:
             if strong_recovery and memory_object.consecutive_weak_runs > 0:
                 memory_object.resurgence_count += 1
                 memory_object.last_strong_recovery_at = timestamp
+            if strong_recovery:
+                memory_object.strong_recovery_count += 1
+                memory_object.consecutive_strong_runs += 1
+                memory_object.last_strong_recovery_at = timestamp
+            else:
+                memory_object.consecutive_strong_runs = 0
             memory_object.consecutive_weak_runs = 0
         if behavior_helped:
             memory_object.downstream_utility += behavior_score if behavior_score is not None else 1.0
@@ -301,6 +310,21 @@ class MemoryLedger:
             suggested_tier = "archived"
             confidence += 0.10
 
+        if (
+            memory_object.tier == "cold"
+            and memory_object.strong_recovery_count >= 1
+            and memory_object.consecutive_strong_runs >= 1
+            and token_agreement >= 0.999
+            and topk_full_rate >= 0.99
+            and first_divergence_step is None
+            and distance_bin in {"medium", "far"}
+        ):
+            suggested_tier = "warm"
+            reasons.append("strong resurgence")
+            if distance_bin in {"medium", "far"}:
+                reasons.append(f"{distance_bin}-bucket recovery")
+            confidence += 0.20
+
         if suggested_tier is None:
             return None
 
@@ -318,6 +342,8 @@ class MemoryLedger:
             "weak_evidence_count": memory_object.weak_evidence_count,
             "consecutive_weak_runs": memory_object.consecutive_weak_runs,
             "resurgence_count": memory_object.resurgence_count,
+            "strong_recovery_count": memory_object.strong_recovery_count,
+            "consecutive_strong_runs": memory_object.consecutive_strong_runs,
             "last_strong_recovery_at": memory_object.last_strong_recovery_at,
             "last_useful_at": memory_object.last_useful_at,
             "token_agreement": token_agreement,
@@ -417,6 +443,8 @@ class MemoryLedger:
                     "weak_evidence_count": memory_object.weak_evidence_count,
                     "consecutive_weak_runs": memory_object.consecutive_weak_runs,
                     "resurgence_count": memory_object.resurgence_count,
+                    "strong_recovery_count": memory_object.strong_recovery_count,
+                    "consecutive_strong_runs": memory_object.consecutive_strong_runs,
                     "last_strong_recovery_at": memory_object.last_strong_recovery_at,
                     "last_useful_at": memory_object.last_useful_at,
                     "token_agreement": memory_object.last_token_agreement,
