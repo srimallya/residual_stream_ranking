@@ -251,6 +251,13 @@ Probe compact replay objects against the exact replay baseline:
 
 The compact replay branch now has a dedicated frontier table in [docs/compact_frontier.md](docs/compact_frontier.md), which separates one-step quality from continuation stability.
 
+For backend porting and architecture-native replay implementation, see the protocol guide in [docs/replay_protocol.md](docs/replay_protocol.md). It documents:
+
+- the replay ladder (`phase 1 -> 2A -> 2B -> 2C`)
+- the architecture invariants that must match native model semantics
+- how to port the resume path to another model family
+- how replay objects, routed recall, and memory lifecycle fit together
+
 Bridge routed Apollo selection into tracked replay evaluation:
 
 ```bash

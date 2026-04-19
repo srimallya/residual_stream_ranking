@@ -431,6 +431,15 @@ class HFTraceRunner:
             logits = logits * final_logit_softcapping
         return logits
 
+    def _model_hidden_size(self) -> int:
+        text_config = self.model.config.get_text_config() if hasattr(self.model.config, "get_text_config") else self.model.config
+        hidden_size = getattr(text_config, "hidden_size", None)
+        if hidden_size is None:
+            hidden_size = getattr(self.model.config, "n_embd", None)
+        if hidden_size is None:
+            raise AttributeError("Could not resolve model hidden size for compact replay accounting.")
+        return int(hidden_size)
+
     def _clone_shared_kv_states(
         self,
         shared_kv_states: dict[int, tuple[object, object]],
@@ -825,8 +834,11 @@ class HFTraceRunner:
         token_index: int = -1,
     ) -> dict[str, object]:
         session = self.trace_text(text)
-        transformer = self._require_gpt2_model()
-        num_layers = len(transformer.h)
+        if self._is_gemma_text_model():
+            num_layers = self._require_gemma_text_model().config.num_hidden_layers
+        else:
+            transformer = self._require_gpt2_model()
+            num_layers = len(transformer.h)
         if boundary_layer < -1 or boundary_layer >= num_layers:
             raise ValueError(
                 f"boundary_layer must be between -1 and {num_layers - 1}, got {boundary_layer}."
@@ -846,6 +858,13 @@ class HFTraceRunner:
         encoded = self._encode_text(text)
         attention_mask_tensor = encoded["attention_mask"]
         attention_mask_list = attention_mask_tensor[0].detach().cpu().tolist()
+        replay_aux_state = None
+        if self._is_gemma_text_model():
+            _, replay_aux_state = self._capture_gemma_boundary_context_from_inputs(
+                input_ids=encoded["input_ids"],
+                attention_mask=encoded["attention_mask"],
+                boundary_layer=replay_layer,
+            )
 
         exact_replay_hidden = np.asarray(session.layer_states[replay_layer], dtype=np.float32).copy()
         exact_logits = self.predict_from_hidden(
@@ -853,6 +872,8 @@ class HFTraceRunner:
             start_layer=replay_layer + 1,
             attention_mask=attention_mask_list,
             target_token_index=-1,
+            input_ids=session.input_ids if self._is_gemma_text_model() else None,
+            resume_aux_state=replay_aux_state,
         )
         exact_token_id = int(np.argmax(exact_logits))
         exact_top_k = self._top_k_tokens(exact_logits, top_k=top_k)
@@ -906,6 +927,8 @@ class HFTraceRunner:
                 start_layer=replay_layer + 1,
                 attention_mask=attention_mask_list,
                 target_token_index=-1,
+                input_ids=session.input_ids if self._is_gemma_text_model() else None,
+                resume_aux_state=replay_aux_state,
             )
             surrogate_delta = surrogate_logits - exact_logits
             surrogate_token_id = int(np.argmax(surrogate_logits))
@@ -961,6 +984,8 @@ class HFTraceRunner:
                 start_layer=replay_layer + 1,
                 attention_mask=attention_mask_list,
                 target_token_index=-1,
+                input_ids=session.input_ids if self._is_gemma_text_model() else None,
+                resume_aux_state=replay_aux_state,
             )
 
             delta = compact_logits - exact_logits
@@ -1014,17 +1039,27 @@ class HFTraceRunner:
         attention_mask: object,
         replay_layer: int,
     ) -> np.ndarray:
-        replay_hidden = self.capture_boundary_hidden_from_inputs(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            boundary_layer=replay_layer,
-        )
+        if self._is_gemma_text_model():
+            replay_hidden, resume_aux_state = self._capture_gemma_boundary_context_from_inputs(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                boundary_layer=replay_layer,
+            )
+        else:
+            replay_hidden = self.capture_boundary_hidden_from_inputs(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                boundary_layer=replay_layer,
+            )
+            resume_aux_state = None
         attention_mask_list = attention_mask[0].detach().cpu().tolist()
         return self.predict_from_hidden(
             hidden_state=replay_hidden,
             start_layer=replay_layer + 1,
             attention_mask=attention_mask_list,
             target_token_index=-1,
+            input_ids=input_ids[0].detach().cpu().tolist() if self._is_gemma_text_model() else None,
+            resume_aux_state=resume_aux_state,
         )
 
     def _compact_next_token_logits_from_inputs(
@@ -1059,11 +1094,20 @@ class HFTraceRunner:
 
         replay_hidden = np.asarray(session.layer_states[replay_layer], dtype=np.float32).copy()
         replay_hidden[resolved_token_index] = reconstructed_token
+        resume_aux_state = None
+        if self._is_gemma_text_model():
+            _, resume_aux_state = self._capture_gemma_boundary_context_from_inputs(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                boundary_layer=replay_layer,
+            )
         return self.predict_from_hidden(
             hidden_state=replay_hidden,
             start_layer=replay_layer + 1,
             attention_mask=session.attention_mask,
             target_token_index=-1,
+            input_ids=session.input_ids if self._is_gemma_text_model() else None,
+            resume_aux_state=resume_aux_state,
         )
 
     def _surrogate_replay_token_next_token_logits_from_inputs(
@@ -1086,11 +1130,20 @@ class HFTraceRunner:
         else:
             raise ValueError(f"Unsupported replay-token surrogate kind: {surrogate_kind}")
         replay_hidden[resolved_token_index] = restored
+        resume_aux_state = None
+        if self._is_gemma_text_model():
+            _, resume_aux_state = self._capture_gemma_boundary_context_from_inputs(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                boundary_layer=replay_layer,
+            )
         return self.predict_from_hidden(
             hidden_state=replay_hidden,
             start_layer=replay_layer + 1,
             attention_mask=session.attention_mask,
             target_token_index=-1,
+            input_ids=session.input_ids if self._is_gemma_text_model() else None,
+            resume_aux_state=resume_aux_state,
         )
 
     def compare_compact_continuation_variants(
@@ -1105,10 +1158,11 @@ class HFTraceRunner:
     ) -> dict[str, object]:
         exact_encoded = self._encode_text(text)
         full_delta_depth = replay_layer - boundary_layer
-        exact_trace_bytes = int((full_delta_depth + 1) * self.model.config.n_embd * np.dtype(np.float32).itemsize)
-        replay_token_bytes = int(self.model.config.n_embd * np.dtype(np.float32).itemsize)
-        replay_token_fp16_bytes = int(self.model.config.n_embd * np.dtype(np.float16).itemsize)
-        replay_token_int8_bytes = int(self.model.config.n_embd * np.dtype(np.int8).itemsize + np.dtype(np.float32).itemsize)
+        hidden_size = self._model_hidden_size()
+        exact_trace_bytes = int((full_delta_depth + 1) * hidden_size * np.dtype(np.float32).itemsize)
+        replay_token_bytes = int(hidden_size * np.dtype(np.float32).itemsize)
+        replay_token_fp16_bytes = int(hidden_size * np.dtype(np.float16).itemsize)
+        replay_token_int8_bytes = int(hidden_size * np.dtype(np.int8).itemsize + np.dtype(np.float32).itemsize)
 
         rows: list[dict[str, object]] = []
         seen_depths: set[int] = set()
@@ -1189,7 +1243,7 @@ class HFTraceRunner:
                     "object_label": f"delta_depth={depth}",
                     "delta_depth": depth,
                     "kept_layers": list(range(replay_layer - depth + 1, replay_layer + 1)) if depth > 0 else [],
-                    "compact_bytes": int((depth + 1) * self.model.config.n_embd * np.dtype(np.float32).itemsize),
+                    "compact_bytes": int((depth + 1) * hidden_size * np.dtype(np.float32).itemsize),
                     "full_replay_token_bytes": replay_token_bytes,
                     "full_trace_bytes": exact_trace_bytes,
                     "token_agreement": token_matches / len(per_step) if per_step else 0.0,

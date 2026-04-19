@@ -1389,3 +1389,28 @@ Gemma 4 2B HF path:
     - `5/5` greedy continuation steps matched exactly
     - no divergence observed
 - GPT-2 regression checks remained exact after the Gemma changes, so the Gemma path is additive rather than a rewrite of the existing GPT-2 stack
+
+Gemma routed bridge probe:
+
+- kept the Apollo router fixed and swapped only the replay backend to:
+  - `models/google--gemma-4-E2B-it`
+- first broad `bridge-apollo-replay` attempts exposed two Gemma-specific portability bugs in the compact bridge path:
+  - compact byte accounting assumed `config.n_embd`
+  - one-step compact replay paths still assumed GPT-2-only resume semantics and failed to pass Gemma's required text-side resume inputs
+- after fixing those path assumptions, the first routed Gemma bridge probe succeeded on a real routed top-1 hit:
+  - Apollo slice: `3` cases
+  - staged routing produced top-1 hits for:
+    - `ARCHIVE-0000` (`far`)
+    - `ARCHIVE-0002` (`near`)
+  - routed replay probe used the first hit:
+    - case: `ARCHIVE-0000`
+    - bucket: `far`
+    - replay cut: boundary `30` -> layer `34`
+- one-step routed replay object results on that far hit:
+  - `token@34`: token match `yes`, top-5 overlap `5/5`
+  - `token@34/fp16`: token match `yes`, top-5 overlap `5/5`
+  - `token@34/int8`: token match `yes`, top-5 overlap `5/5`
+  - `delta_depth=4`: token match `yes`, top-5 overlap `5/5`
+- operational constraint:
+  - even this minimal routed Gemma probe took about `81.8s` on CPU
+  - so Gemma replay correctness now reaches into the routed bridge, but the current generic bridge harness is too expensive on CPU for broad Gemma sweeps without a lighter evaluation path or better model residency/caching
