@@ -43,6 +43,13 @@ class ReconstructionResult:
     exact_trace: bool
 
 
+@dataclass(slots=True)
+class TraceCaptureResult:
+    payload: TraceCheckpointPayload
+    observed_states: dict[int, np.ndarray]
+    token_count: int
+
+
 def cosine_similarity(left: np.ndarray, right: np.ndarray) -> float:
     left_norm = np.linalg.norm(left)
     right_norm = np.linalg.norm(right)
@@ -75,6 +82,69 @@ def verify_reconstruction(
         l2_error=float(np.linalg.norm(delta)),
         cosine_similarity=cosine_similarity(reconstructed, observed),
         exact_trace=payload.exact_trace,
+    )
+
+
+def build_trace_payload_from_states(
+    *,
+    layer_states: dict[int, np.ndarray],
+    layer_cutoff_b: int,
+    token_index: int,
+    delta_layers: list[int],
+    metadata: TraceMetadata | None = None,
+) -> TraceCheckpointPayload:
+    if layer_cutoff_b not in layer_states:
+        raise ValueError(f"Missing boundary state for layer {layer_cutoff_b}.")
+
+    missing_layers = [layer for layer in delta_layers if layer not in layer_states or (layer - 1) not in layer_states]
+    if missing_layers:
+        raise ValueError(f"Missing required layer states for deltas: {missing_layers}.")
+
+    boundary_residual = np.asarray(layer_states[layer_cutoff_b], dtype=np.float32).copy()
+    late_layer_deltas = [
+        np.asarray(layer_states[layer], dtype=np.float32) - np.asarray(layer_states[layer - 1], dtype=np.float32)
+        for layer in delta_layers
+    ]
+    trace_metadata = metadata or TraceMetadata(
+        shape=tuple(boundary_residual.shape),
+        dtype=str(boundary_residual.dtype),
+        provenance="observed-layer-states",
+    )
+    return TraceCheckpointPayload(
+        layer_cutoff_b=layer_cutoff_b,
+        boundary_token_index=token_index,
+        boundary_residual=boundary_residual,
+        late_layer_deltas=late_layer_deltas,
+        delta_layers=list(delta_layers),
+        metadata=trace_metadata,
+        exact_trace=True,
+        approximate_trace=False,
+    )
+
+
+def capture_from_layer_states(
+    *,
+    layer_states: dict[int, np.ndarray],
+    layer_cutoff_b: int,
+    token_index: int,
+    delta_layers: list[int],
+    metadata: TraceMetadata | None = None,
+) -> TraceCaptureResult:
+    payload = build_trace_payload_from_states(
+        layer_states=layer_states,
+        layer_cutoff_b=layer_cutoff_b,
+        token_index=token_index,
+        delta_layers=delta_layers,
+        metadata=metadata,
+    )
+    observed = {
+        layer: np.asarray(layer_states[layer], dtype=np.float32).copy()
+        for layer in sorted({layer_cutoff_b, *delta_layers})
+    }
+    return TraceCaptureResult(
+        payload=payload,
+        observed_states=observed,
+        token_count=max(token_index + 1, 0),
     )
 
 

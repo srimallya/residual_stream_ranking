@@ -2,15 +2,36 @@
 
 Residual Stream Ranking is a small Python research harness for testing long-context retrieval strategies against a local GGUF model.
 
-The current implementation focuses on a practical sidecar-memory approach:
+The current system uses a practical sidecar-memory design:
 
 - keep a short exact recent context window
 - compress older windows into checkpoint objects
-- retrieve the most relevant checkpoints at query time
-- replay those checkpoints back to the model as memory packets
-- compare semantic retrieval against a temporal reranking pass
+- retrieve a semantic candidate pool
+- rerank that pool with a staged retrieval stack
+- replay the selected checkpoints back to the model as memory packets
+- optionally expand the selected checkpoint with a tiny local neighborhood
 
 This is intentionally a prototype for ranking and replay behavior. It does not claim exact late-layer residual reconstruction because the current `llama-cpp-python` backend does not expose the per-layer residual deltas needed for that experiment.
+
+## Current State
+
+The project now has a valid corpus-backed result on the Apollo benchmark with `Qwen3.5-2B-Q8_0.gguf`.
+
+On a valid 12-case Apollo run:
+
+- `recent`: `0.00` accuracy
+- `retrieval`: `0.17` accuracy
+- `temporal` with staged reranking: `0.42` accuracy
+- `temporal_expanded` with one neighbor window: `0.58` accuracy
+- `full`: `0.75` accuracy
+- `oracle`: `1.00` accuracy
+
+The current interpretation is:
+
+- staged reranking largely fixes the ranking problem
+- local expansion improves downstream memory sufficiency
+- the remaining gap to `full` and `oracle` is now a real replay-sufficiency / model-use gap
+- parse/answer-channel instability is no longer the dominant source of error on the main Apollo path
 
 ## What It Does
 
@@ -25,7 +46,8 @@ The benchmark modes are:
 - `full`: pass the full document to the model
 - `recent`: pass only the most recent windows
 - `retrieval`: combine recent windows with top-k retrieved historical checkpoints
-- `temporal`: apply semantic retrieval plus temporal graph reranking using recent context as the active thread
+- `temporal`: semantic pool selection plus staged reranking
+- `temporal_expanded`: staged reranking plus a tiny local neighborhood around the selected memory
 
 Each checkpoint stores:
 
@@ -34,18 +56,25 @@ Each checkpoint stores:
   - window embedding
   - boundary embedding
   - extracted terms
+  - extracted anchors
 - a trace payload reserved for future exact-reconstruction experiments
   - boundary residual at a layer cutoff
   - selected late-layer deltas
-
-Retrieval uses embedding similarity between the question and each checkpoint. Temporal mode adds a lightweight reranker over checkpoint links derived from shared terms and temporal proximity.
 
 Today only the semantic payload is populated. The trace payload exists to make the separation explicit:
 
 - semantic payload answers: "which past region should I retrieve?"
 - trace payload answers: "if the backend exposes the right internals, what exact state pieces could I reconstruct?"
 
-The Apollo evaluator also reports routing diagnostics:
+The stronger retrieval path is now a staged stack:
+
+1. semantic pool selection
+2. temporal / graph reranking inside that pool
+3. local anchor-aware refinement
+
+An optional expansion step can then add one local neighbor window around the selected checkpoint to test replay sufficiency.
+
+The Apollo evaluator reports routing and use diagnostics:
 
 - target hit rate
 - oracle-correct memory accuracy
@@ -53,6 +82,8 @@ The Apollo evaluator also reports routing diagnostics:
 - mean reciprocal rank (MRR)
 - parse given hit
 - correct given hit and parse
+- wrong window rate
+- staged-vs-oracle gap rows for failed cases
 
 ## Project Layout
 
@@ -70,6 +101,8 @@ tests/
 models/
   Qwen3.5-2B-GGUF/
   Qwen3.5-4B-GGUF/
+data/
+  apollo11_clean.txt
 ```
 
 ## Requirements
@@ -93,7 +126,7 @@ Run the synthetic benchmark:
 
 ```bash
 .venv/bin/residual-lab benchmark \
-  --model-path models/Qwen3.5-2B-Q8_0.gguf \
+  --model-path models/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf \
   --windows 8 \
   --window-lines 6 \
   --recent-windows 2 \
@@ -115,6 +148,37 @@ Run the Apollo corpus benchmark:
   --n-ctx 4096
 ```
 
+Run the stronger staged Apollo path:
+
+```bash
+.venv/bin/residual-lab benchmark-apollo \
+  --model-path models/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf \
+  --corpus-path data/apollo11_clean.txt \
+  --case-count 12 \
+  --windows 12 \
+  --window-lines 24 \
+  --recent-windows 2 \
+  --top-k 2 \
+  --n-ctx 4096 \
+  --rerank-strategy staged
+```
+
+Run the staged local-expansion ablation:
+
+```bash
+.venv/bin/residual-lab benchmark-apollo \
+  --model-path models/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf \
+  --corpus-path data/apollo11_clean.txt \
+  --case-count 12 \
+  --windows 12 \
+  --window-lines 24 \
+  --recent-windows 2 \
+  --top-k 2 \
+  --n-ctx 4096 \
+  --rerank-strategy staged \
+  --local-expansion-neighbors 1
+```
+
 Run the Apollo routing-only ablation:
 
 ```bash
@@ -131,38 +195,51 @@ Run the Apollo routing-only ablation:
 Useful flags:
 
 - `--model-path`: path to the GGUF model
-- `--windows`: total synthetic windows in the generated document
-- `--window-lines`: lines per synthetic window
+- `--windows`: total windows in the generated document or corpus slice
+- `--window-lines`: lines per window
 - `--recent-windows`: exact local context horizon
 - `--top-k`: number of retrieved checkpoints
-- `--queries`: number of benchmark queries
+- `--queries`: number of synthetic benchmark queries
 - `--seed`: deterministic benchmark seed
-- `--n_ctx`: inference context size
+- `--n-ctx`: inference context size
+- `--rerank-strategy`: retrieval strategy for temporal mode, including `staged`
+- `--local-expansion-neighbors`: neighbor radius for the `temporal_expanded` ablation
 
 ## Interpreting Results
 
-Expected behavior for this prototype:
+Expected behavior for the current prototype:
 
 - `recent` should lose far-past information as the context horizon shrinks
-- `retrieval` should improve recall over `recent`
-- `temporal` may improve over pure retrieval when the recent thread helps rank older checkpoints
-- `full` remains the ceiling for this setup
+- `retrieval` should improve over `recent`, but may still fail from poor ranking
+- `temporal` should improve materially over plain retrieval when staged reranking is enabled
+- `temporal_expanded` may improve over `temporal` when the remaining gap is local memory sufficiency
+- `full` remains the main control path
+- `oracle` remains the replay ceiling
+
+The current benchmark evidence supports this decomposition:
+
+- routing used to be the dominant bottleneck
+- staged reranking fixes a large part of that routing loss
+- local expansion helps on harder cases, especially the medium-distance bucket
+- the remaining gap is now mostly replay sufficiency / model use after correct retrieval
 
 ## Current Limitations
 
-- the benchmark is synthetic, not task-grounded on production traces
 - checkpoint replay is a text-memory proxy, not exact residual-state replay
+- the Apollo benchmark is still a constructed harness, not a production task suite
 - quality depends heavily on the selected model and embedding behavior
-- the bundled GGUF model is a local dependency and is not intended to be committed to git
+- the current backend cannot populate the trace payload with true residual tensors
+- the bundled GGUF models are local dependencies and are not intended to be committed to git
 
 ## Roadmap
 
-Likely next steps if you want to validate the stronger residual-stream idea:
+Likely next steps from the current state:
 
-1. Swap to a backend that exposes layerwise residual or hidden-state traces.
-2. Populate the trace payload with exact residual-state checkpoint objects.
-3. Add evaluation for reconstruction fidelity alongside answer quality.
-4. Benchmark on real long-context tasks, not only synthetic recall prompts.
+1. Improve replay packet quality on the staged-hit-but-wrong slice.
+2. Test larger local neighborhoods and packet enrichment against the medium-distance bucket.
+3. Run context-budget ablations such as `4096` vs `8192`.
+4. Swap to a backend that exposes layerwise residual or hidden-state traces.
+5. Populate the trace payload with exact residual-state checkpoint objects and evaluate reconstruction fidelity.
 
 ## License
 

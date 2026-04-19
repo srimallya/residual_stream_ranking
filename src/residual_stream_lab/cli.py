@@ -14,12 +14,23 @@ from residual_stream_lab.checkpointing import (
     split_windows,
 )
 from residual_stream_lab.llm import GGUFRunner
+from residual_stream_lab.hf_trace import HFTraceRunner
 from residual_stream_lab.apollo import ApolloCase, build_apollo_cases
 from residual_stream_lab.synthetic import BenchmarkCase, build_benchmark_case
 from residual_stream_lab.temporal import rerank_checkpoints
+from residual_stream_lab.trace import verify_reconstruction
 
 app = typer.Typer(add_completion=False)
 console = Console()
+
+
+def parse_layer_spec(spec: str) -> list[int]:
+    values = [int(value.strip()) for value in spec.split(",") if value.strip()]
+    if not values:
+        raise typer.BadParameter("Layer list must contain at least one integer.")
+    if values != sorted(set(values)):
+        raise typer.BadParameter("Layer list must be unique and sorted ascending.")
+    return values
 
 
 def expand_window_ids(
@@ -572,6 +583,59 @@ def evaluate_routing_only(
         "top4": top4 / count,
         "mrr": reciprocal_rank_sum / count,
     }
+
+
+@app.command("trace-verify")
+def trace_verify(
+    model_name_or_path: str = typer.Option(..., help="Transformers model id or local path."),
+    prompt: str = typer.Option(..., help="Prompt to trace."),
+    layer_cutoff_b: int = typer.Option(..., help="Boundary layer used as the replay anchor."),
+    delta_layers: str = typer.Option(..., help="Comma-separated logical layers to add after the boundary."),
+    token_index: int = typer.Option(-1, help="Token index to trace. Defaults to the last token."),
+    device: str = typer.Option("cpu", help="Torch device for the HF trace backend."),
+    dtype: str = typer.Option("auto", help="Torch dtype: auto, float32, float16, or bfloat16."),
+) -> None:
+    parsed_delta_layers = parse_layer_spec(delta_layers)
+    if parsed_delta_layers[0] <= layer_cutoff_b:
+        raise typer.BadParameter("All delta layers must be greater than the boundary layer.")
+
+    runner = HFTraceRunner(
+        model_name_or_path=model_name_or_path,
+        device=device,
+        dtype=dtype,
+    )
+    capture = runner.capture_trace(
+        text=prompt,
+        layer_cutoff_b=layer_cutoff_b,
+        delta_layers=parsed_delta_layers,
+        token_index=token_index,
+    )
+    target_layer = parsed_delta_layers[-1]
+    verification = verify_reconstruction(
+        capture.payload,
+        capture.observed_states[target_layer],
+    )
+
+    console.print(
+        "[bold]HF Trace Verification[/bold]\n"
+        "Offline reconstruction from a boundary hidden state plus observed per-layer deltas."
+    )
+    console.print(f"Backend: {runner.backend}")
+    console.print(f"Model: {runner.model_name_or_path}")
+    console.print(f"Prompt tokens: {capture.token_count}")
+    console.print(f"Boundary layer: {layer_cutoff_b}")
+    console.print(f"Delta layers: {', '.join(str(value) for value in parsed_delta_layers)}")
+    console.print(f"Target layer: {target_layer}")
+    console.print(f"Token index: {capture.payload.boundary_token_index}")
+
+    table = Table(title="Reconstruction Metrics")
+    table.add_column("Metric")
+    table.add_column("Value")
+    table.add_row("L2 error", f"{verification.l2_error:.8f}")
+    table.add_row("Cosine similarity", f"{verification.cosine_similarity:.8f}")
+    table.add_row("Exact trace", "yes" if verification.exact_trace else "no")
+    table.add_row("Vector shape", str(capture.payload.metadata.shape if capture.payload.metadata else ()))
+    console.print(table)
 
 
 @app.command()
