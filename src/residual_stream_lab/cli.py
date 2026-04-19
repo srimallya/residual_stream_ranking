@@ -627,6 +627,20 @@ def evaluate_routed_replay_bridge(
         }
         for label in object_order
     }
+    distance_aggregates: dict[str, dict[str, dict[str, float | int]]] = {
+        distance_bin: {
+            label: {
+                "cases": 0,
+                "token_agreement_sum": 0.0,
+                "topk_full_steps_sum": 0,
+                "steps_sum": 0,
+                "divergence_count": 0,
+                "compact_bytes": 0,
+            }
+            for label in object_order
+        }
+        for distance_bin in ["near", "medium", "far"]
+    }
     per_case: list[dict[str, object]] = []
     top1_hits = 0
     topk_hits = 0
@@ -696,6 +710,14 @@ def evaluate_routed_replay_bridge(
                 aggregate["divergence_count"] += int(row["first_divergence_step"] is not None)
                 if aggregate["compact_bytes"] == 0:
                     aggregate["compact_bytes"] = int(row["compact_bytes"])
+                distance_aggregate = distance_aggregates[case.distance_bin][label]
+                distance_aggregate["cases"] += 1
+                distance_aggregate["token_agreement_sum"] += float(row["token_agreement"])
+                distance_aggregate["topk_full_steps_sum"] += int(row["topk_full_steps"])
+                distance_aggregate["steps_sum"] += int(row["steps_completed"])
+                distance_aggregate["divergence_count"] += int(row["first_divergence_step"] is not None)
+                if distance_aggregate["compact_bytes"] == 0:
+                    distance_aggregate["compact_bytes"] = int(row["compact_bytes"])
 
         per_case.append(case_row)
 
@@ -715,6 +737,24 @@ def evaluate_routed_replay_bridge(
             }
         )
 
+    distance_summary: dict[str, list[dict[str, object]]] = {}
+    for distance_bin, per_object in distance_aggregates.items():
+        distance_summary[distance_bin] = []
+        for label in object_order:
+            aggregate = per_object[label]
+            cases_count = int(aggregate["cases"])
+            steps_sum = int(aggregate["steps_sum"])
+            distance_summary[distance_bin].append(
+                {
+                    "object_label": label,
+                    "cases": cases_count,
+                    "compact_bytes": int(aggregate["compact_bytes"]),
+                    "token_agreement": (float(aggregate["token_agreement_sum"]) / cases_count) if cases_count else 0.0,
+                    "topk_full_rate": (int(aggregate["topk_full_steps_sum"]) / steps_sum) if steps_sum else 0.0,
+                    "divergence_rate": (int(aggregate["divergence_count"]) / cases_count) if cases_count else 0.0,
+                }
+            )
+
     return {
         "case_count": len(cases),
         "top1_hit_rate": top1_hits / len(cases) if cases else 0.0,
@@ -724,6 +764,7 @@ def evaluate_routed_replay_bridge(
         "replay_layer": replay_layer,
         "replay_steps": replay_steps,
         "summary_rows": summary_rows,
+        "distance_summary": distance_summary,
         "per_case": per_case,
     }
 
@@ -1962,6 +2003,28 @@ def bridge_apollo_replay(
             f"{row['divergence_rate']:.2f}",
         )
     console.print(replay_table)
+
+    for distance_bin in ["near", "medium", "far"]:
+        distance_rows = summary["distance_summary"][distance_bin]
+        if not any(row["cases"] for row in distance_rows):
+            continue
+        distance_table = Table(title=f"Hit-Conditioned Replay Summary ({distance_bin})")
+        distance_table.add_column("Object")
+        distance_table.add_column("Bytes")
+        distance_table.add_column("Hit Cases")
+        distance_table.add_column("Token Agreement")
+        distance_table.add_column(f"Top-{replay_top_k} Full Rate")
+        distance_table.add_column("Divergence Rate")
+        for row in distance_rows:
+            distance_table.add_row(
+                str(row["object_label"]),
+                str(row["compact_bytes"]),
+                str(row["cases"]),
+                f"{row['token_agreement']:.2f}",
+                f"{row['topk_full_rate']:.2f}",
+                f"{row['divergence_rate']:.2f}",
+            )
+        console.print(distance_table)
 
 
 if __name__ == "__main__":

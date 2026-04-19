@@ -903,3 +903,148 @@ Current bridge read:
 - the first bridge validation is small, but it shows the intended stack is executable end to end
 - the bridge surface now includes a plain text control, so tracked replay objects can be compared against ordinary routed text on the same hit slice
 - the next bridge question is no longer "can we connect them?" but "which replay object wins once the routed hit slice gets larger and harder?"
+
+Widened bridge slice:
+
+- the staged router was then widened to a `9`-case Apollo slice with the same replay cut:
+  - boundary `6`
+  - replay layer `10`
+  - replay horizon `10`
+- staged routing stayed strong enough to make the bridge meaningful:
+  - top-1 hit rate: `0.78`
+  - top-k hit rate: `1.00`
+
+This was the first bridge run that actually separated replay objects:
+
+- `text@window`:
+  - token agreement: `1.00`
+  - top-5 full rate: `1.00`
+- `token@10`:
+  - token agreement: `1.00`
+  - top-5 full rate: `1.00`
+- `token@10/fp16`:
+  - token agreement: `1.00`
+  - top-5 full rate: `0.99`
+- `token@10/int8`:
+  - token agreement: `0.86`
+  - top-5 full rate: `0.79`
+  - divergence rate: `0.14`
+- full late band `delta_depth=4`:
+  - token agreement: `1.00`
+  - top-5 full rate: `1.00`
+
+Bucketed view:
+
+- near hits:
+  - `int8` replay token stays reasonably strong
+  - token agreement: `1.00`
+  - top-5 full rate: `0.87`
+- medium hits:
+  - still easy on this slice
+  - `int8` replay token token agreement: `1.00`
+  - top-5 full rate: `0.90`
+- far hits:
+  - first clearly discriminative bucket
+  - `text@window`, exact replay token, `fp16`, and full late band all stayed clean
+  - `int8` replay token dropped to:
+    - token agreement: `0.67`
+    - top-5 full rate: `0.67`
+    - divergence rate: `0.33`
+
+Updated bridge read:
+
+- the routed bridge is now discriminative on a harder slice
+- `int8` replay-token compression is the first object to degrade materially under routed Apollo pressure
+- `fp16` replay-token storage remains extremely strong and is now close to the exact/text/full-band group on the tested bridge slice
+
+Wider discriminative bridge slice:
+
+- the bridge was widened again to a `12`-case Apollo slice with the same fixed router and object panel
+- staged routing stayed strong:
+  - top-1 hit rate: `0.83`
+  - top-k hit rate: `1.00`
+
+The separation persisted and sharpened:
+
+- `text@window`: token agreement `1.00`, top-5 full rate `1.00`
+- `token@10`: token agreement `1.00`, top-5 full rate `1.00`
+- `token@10/fp16`: token agreement `1.00`, top-5 full rate `0.99`
+- `token@10/int8`:
+  - token agreement: `0.81`
+  - top-5 full rate: `0.73`
+  - divergence rate: `0.20`
+- full late band `delta_depth=4`: token agreement `1.00`, top-5 full rate `1.00`
+
+Bucketed view on the widened slice:
+
+- near hits:
+  - `int8` still degrades, but more mildly
+  - token agreement: `1.00`
+  - top-5 full rate: `0.90`
+- medium hits:
+  - `int8` degrades sharply
+  - token agreement: `0.55`
+  - top-5 full rate: `0.55`
+  - divergence rate: `0.50`
+- far hits:
+  - `int8` remains clearly degraded
+  - token agreement: `0.75`
+  - top-5 full rate: `0.65`
+  - divergence rate: `0.25`
+
+Current bridge conclusion:
+
+- the routed bridge is now robustly discriminative on widened Apollo slices
+- `text@window`, exact replay token, `fp16`, and the full late band remain in the stable group on the tested bridge slices
+- `int8` replay-token compression is now a demonstrated loser under routed pressure, not just a suggestive boundary
+
+Larger bucket-balanced bridge slice:
+
+- the bridge was widened again to an `18`-case Apollo slice, keeping the same fixed router, replay cut, and object panel
+- staged routing remained stable:
+  - top-1 hit rate: `0.78`
+  - top-k hit rate: `1.00`
+- routed top-1 hits covered `14` cases, which gives a more balanced read across the `near` / `medium` / `far` buckets
+
+Overall hit-conditioned replay summary:
+
+- `text@window`:
+  - token agreement: `1.00`
+  - top-5 full rate: `1.00`
+- `token@10`:
+  - token agreement: `1.00`
+  - top-5 full rate: `1.00`
+- `token@10/fp16`:
+  - token agreement: `1.00`
+  - top-5 full rate: `0.99`
+- `token@10/int8`:
+  - token agreement: `0.86`
+  - top-5 full rate: `0.79`
+  - divergence rate: `0.14`
+- full late band `delta_depth=4`:
+  - token agreement: `1.00`
+  - top-5 full rate: `1.00`
+
+Bucketed view on the larger slice:
+
+- near hits:
+  - `int8` stays usable at the token level but still sheds ranking stability
+  - token agreement: `1.00`
+  - top-5 full rate: `0.90`
+- medium hits:
+  - `int8` remains a real failure mode rather than a one-off anomaly
+  - token agreement: `0.78`
+  - top-5 full rate: `0.75`
+  - divergence rate: `0.25`
+- far hits:
+  - `int8` also remains clearly degraded
+  - token agreement: `0.80`
+  - top-5 full rate: `0.70`
+  - divergence rate: `0.20`
+- `text@window`, exact replay token, `fp16`, and full late band all stayed behaviorally clean in every bucket on this slice
+
+Updated bridge read:
+
+- the bridge hierarchy survives the larger, more balanced Apollo slice
+- `token@10/fp16` remains effectively in the safe group, with only slight ranking softness
+- `token@10/int8` continues to be the first replay object that fails under routed pressure, and it now does so in both the medium and far buckets rather than only in a single stressed corner
