@@ -124,20 +124,59 @@ body {
 
 .message-body p,
 .message-body ul,
+.message-body ol,
+.message-body h1,
+.message-body h2,
+.message-body h3,
+.message-body h4,
+.message-body h5,
+.message-body h6,
 .message-body pre {
   margin: 0;
 }
 
 .message-body p + p,
 .message-body p + ul,
+.message-body p + ol,
 .message-body ul + p,
+.message-body ol + p,
+.message-body h1 + p,
+.message-body h2 + p,
+.message-body h3 + p,
+.message-body h4 + p,
+.message-body h5 + p,
+.message-body h6 + p,
 .message-body pre + p,
-.message-body p + pre {
+.message-body p + pre,
+.message-body h1 + ul,
+.message-body h2 + ul,
+.message-body h3 + ul,
+.message-body h4 + ul,
+.message-body h5 + ul,
+.message-body h6 + ul,
+.message-body h1 + ol,
+.message-body h2 + ol,
+.message-body h3 + ol,
+.message-body h4 + ol,
+.message-body h5 + ol,
+.message-body h6 + ol {
   margin-top: 8px;
 }
 
-.message-body ul {
+.message-body ul,
+.message-body ol {
   padding-left: 16px;
+}
+
+.message-body h1,
+.message-body h2,
+.message-body h3,
+.message-body h4,
+.message-body h5,
+.message-body h6 {
+  font-size: 11px;
+  line-height: 1.3;
+  letter-spacing: 0.02em;
 }
 
 .message-body code {

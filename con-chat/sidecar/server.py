@@ -26,6 +26,8 @@ MODEL_DEVICE = os.environ.get("CON_CHAT_MODEL_DEVICE", "mps")
 ORCHESTRATION_DEVICE = os.environ.get("CON_CHAT_ORCHESTRATION_DEVICE", "cpu")
 DEFAULT_CONVERSATION_ID = "demo-thread"
 MAX_TOKENS = 32768
+PRIMARY_MAX_NEW_TOKENS = 512
+FALLBACK_MAX_NEW_TOKENS = 384
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ENTITY_STOPWORDS = {
     "about", "after", "again", "also", "and", "answer", "are", "assist", "based", "because",
@@ -315,6 +317,7 @@ class GemmaRuntime:
         self.dtype = torch.float32
         self.tokenizer = None
         self.model = None
+        self.response_pattern: re.Pattern[str] | None = None
         self.lock = threading.Lock()
         self.load_seconds = 0.0
         self.ready = False
@@ -341,6 +344,7 @@ class GemmaRuntime:
             self.actual_device = device
             self.dtype = dtype
             self.tokenizer = tokenizer
+            self.response_pattern = self._load_response_pattern()
             self.model = model
             self.ready = True
         except Exception as exc:  # pragma: no cover - startup failure path
@@ -373,21 +377,24 @@ class GemmaRuntime:
 
         prompt_start = time.perf_counter()
         prompt = self._format_prompt(turns)
-        model_inputs = self.tokenizer(prompt, return_tensors="pt").input_ids
+        prompt_batch = self.tokenizer(prompt, return_tensors="pt", return_attention_mask=True)
+        model_inputs = prompt_batch.input_ids
+        attention_mask = prompt_batch.attention_mask
         prompt_seconds = time.perf_counter() - prompt_start
 
         generation_start = time.perf_counter()
         with self.lock, torch.inference_mode():
             inputs = model_inputs.to(self.actual_device)
+            attn = attention_mask.to(self.actual_device)
             outputs = self.model.generate(
                 inputs,
-                max_new_tokens=160,
+                attention_mask=attn,
+                max_new_tokens=PRIMARY_MAX_NEW_TOKENS,
                 do_sample=True,
-                temperature=0.68,
-                top_p=0.9,
-                top_k=40,
-                repetition_penalty=1.12,
-                no_repeat_ngram_size=3,
+                temperature=1.0,
+                top_p=0.95,
+                top_k=64,
+                repetition_penalty=1.1,
                 pad_token_id=self.tokenizer.eos_token_id,
                 eos_token_id=self.tokenizer.eos_token_id,
             )
@@ -395,57 +402,41 @@ class GemmaRuntime:
 
         prompt_tokens = int(model_inputs.shape[-1])
         generated_ids = outputs[0, prompt_tokens:]
-        assistant_text = self._clean_response(
-            self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-        )
+        decoded = self.tokenizer.decode(generated_ids, skip_special_tokens=False)
+        thinking_text, assistant_text = self._parse_response(decoded)
         completion_tokens = int(generated_ids.shape[-1])
 
-        if self._is_degenerate_response(assistant_text):
+        if self._needs_retry(assistant_text):
             retry_start = time.perf_counter()
             with self.lock, torch.inference_mode():
                 retry_outputs = self.model.generate(
                     inputs,
-                    max_new_tokens=160,
+                    attention_mask=attn,
+                    max_new_tokens=PRIMARY_MAX_NEW_TOKENS,
                     do_sample=True,
-                    temperature=0.82,
-                    top_p=0.92,
-                    top_k=48,
-                    repetition_penalty=1.16,
-                    no_repeat_ngram_size=3,
+                    temperature=1.0,
+                    top_p=0.95,
+                    top_k=64,
+                    repetition_penalty=1.1,
                     pad_token_id=self.tokenizer.eos_token_id,
                     eos_token_id=self.tokenizer.eos_token_id,
                 )
             generation_seconds += time.perf_counter() - retry_start
             generated_ids = retry_outputs[0, prompt_tokens:]
-            assistant_text = self._clean_response(
-                self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-            )
+            decoded = self.tokenizer.decode(generated_ids, skip_special_tokens=False)
+            thinking_text, assistant_text = self._parse_response(decoded)
             completion_tokens = int(generated_ids.shape[-1])
 
-        if self._is_degenerate_response(assistant_text):
-            fallback_prompt = self._format_fallback_prompt(turns[-1]["text"])
-            fallback_inputs = self.tokenizer(fallback_prompt, return_tensors="pt").input_ids
-            retry_start = time.perf_counter()
-            with self.lock, torch.inference_mode():
-                fallback_outputs = self.model.generate(
-                    fallback_inputs.to(self.actual_device),
-                    max_new_tokens=120,
-                    do_sample=False,
-                    repetition_penalty=1.12,
-                    no_repeat_ngram_size=3,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                )
-            generation_seconds += time.perf_counter() - retry_start
-            fallback_prompt_tokens = int(fallback_inputs.shape[-1])
-            generated_ids = fallback_outputs[0, fallback_prompt_tokens:]
-            assistant_text = self._clean_response(
-                self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+        if self._looks_truncated(assistant_text, completion_tokens, PRIMARY_MAX_NEW_TOKENS):
+            assistant_text, completion_tokens, continuation_seconds = self._continue_response(
+                user_text=turns[-1]["text"],
+                partial_answer=assistant_text,
             )
-            completion_tokens = int(generated_ids.shape[-1])
+            generation_seconds += continuation_seconds
 
-        if not assistant_text or self._is_degenerate_response(assistant_text):
+        if self._needs_retry(assistant_text):
             assistant_text = self._safe_fallback_reply(turns[-1]["text"] if turns else "")
+            thinking_text = ""
             completion_tokens = self.count_tokens(assistant_text)
 
         return assistant_text, {
@@ -455,13 +446,14 @@ class GemmaRuntime:
             "promptTokens": prompt_tokens,
             "completionTokens": completion_tokens,
             "modelDevice": self.actual_device,
+            "thinking": thinking_text,
         }
 
     def _format_prompt(self, turns: list[sqlite3.Row]) -> str:
         chunks: list[str] = [
-            "<start_of_turn>user",
+            "<|turn>system\n",
             SYSTEM_PROMPT,
-            "<end_of_turn>",
+            "<turn|>",
         ]
         for row in turns:
             role = row["role"]
@@ -471,34 +463,123 @@ class GemmaRuntime:
             if self._is_preview_artifact(text):
                 continue
             if role == "user":
-                chunks.extend(["<start_of_turn>user", text, "<end_of_turn>"])
+                chunks.extend(["<|turn>user\n", text, "<turn|>"])
             elif role == "assistant":
-                chunks.extend(["<start_of_turn>model", text, "<end_of_turn>"])
-        chunks.append("<start_of_turn>model")
+                chunks.extend(["<|turn>model\n", text, "<turn|>"])
+        chunks.append("<|turn>model\n")
         return "\n".join(chunks)
 
-    def _format_fallback_prompt(self, user_text: str) -> str:
+    def _format_fallback_prompt(self, user_text: str, partial_answer: str = "") -> str:
         return "\n".join(
             [
-                "<start_of_turn>user",
+                "<|turn>system\n",
                 SYSTEM_PROMPT,
-                "Answer the user's question in 2 to 4 direct sentences.",
+                "Continue the assistant answer cleanly from the partial draft.",
                 "Do not mention Google or a model vendor unless asked directly.",
-                "Do not repeat filler. Do not echo the prompt.",
-                "Do not show thinking, reasoning steps, headings, bullet plans, or symbolic scaffolding.",
-                "Do not number steps. Do not write labels like Analyze, Boundaries, Relations, or Answer.",
-                "Start directly with the answer sentence.",
+                "Do not restart from the beginning unless necessary.",
+                "Finish the answer naturally.",
+                "Do not add meta commentary about the answer.",
                 "Return the final answer only.",
-                "<end_of_turn>",
-                "<start_of_turn>user",
+                "<turn|>",
+                "<|turn>user\n",
                 user_text,
-                "<end_of_turn>",
-                "<start_of_turn>model",
+                "<turn|>",
+                "<|turn>model\n",
+                partial_answer,
+                "<turn|>",
+                "<|turn>model\n",
             ]
         )
 
+    def _load_response_pattern(self) -> re.Pattern[str] | None:
+        if not self.tokenizer:
+            return None
+        response_schema = getattr(self.tokenizer, "init_kwargs", {}).get("response_schema")
+        if not response_schema:
+            return None
+        regex = response_schema.get("x-regex")
+        if not regex:
+            return None
+        return re.compile(regex, flags=re.DOTALL)
+
+    def _parse_response(self, text: str) -> tuple[str, str]:
+        raw = text.strip()
+        thinking = ""
+        content = raw
+        if self.response_pattern is not None:
+            match = self.response_pattern.search(raw)
+            if match:
+                thinking = (match.groupdict().get("thinking") or "").strip()
+                content = (match.groupdict().get("content") or "").strip()
+        answer = self._clean_response(content)
+        return thinking, answer
+
+    def _continue_response(self, user_text: str, partial_answer: str) -> tuple[str, int, float]:
+        answer = partial_answer.strip()
+        total_seconds = 0.0
+        total_completion_tokens = self.count_tokens(answer)
+
+        for _ in range(2):
+            if not self._looks_truncated(answer, total_completion_tokens, FALLBACK_MAX_NEW_TOKENS):
+                break
+
+            fallback_prompt = self._format_fallback_prompt(user_text, answer)
+            fallback_batch = self.tokenizer(fallback_prompt, return_tensors="pt", return_attention_mask=True)
+            fallback_inputs = fallback_batch.input_ids
+            fallback_attention_mask = fallback_batch.attention_mask
+
+            retry_start = time.perf_counter()
+            with self.lock, torch.inference_mode():
+                fallback_outputs = self.model.generate(
+                    fallback_inputs.to(self.actual_device),
+                    attention_mask=fallback_attention_mask.to(self.actual_device),
+                    max_new_tokens=FALLBACK_MAX_NEW_TOKENS,
+                    do_sample=False,
+                    repetition_penalty=1.08,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                )
+            total_seconds += time.perf_counter() - retry_start
+
+            fallback_prompt_tokens = int(fallback_inputs.shape[-1])
+            generated_ids = fallback_outputs[0, fallback_prompt_tokens:]
+            decoded = self.tokenizer.decode(generated_ids, skip_special_tokens=False)
+            _, continued_answer = self._parse_response(decoded)
+            if not continued_answer:
+                break
+
+            answer = self._merge_continuation(answer, continued_answer)
+            total_completion_tokens = self.count_tokens(answer)
+
+        return answer, total_completion_tokens, total_seconds
+
+    def _merge_continuation(self, base: str, continuation: str) -> str:
+        if not base:
+            return continuation
+        if not continuation:
+            return base
+        if continuation in base:
+            return base
+
+        max_overlap = min(len(base), len(continuation), 240)
+        overlap = 0
+        for size in range(max_overlap, 24, -1):
+            if base[-size:] == continuation[:size]:
+                overlap = size
+                break
+
+        if overlap:
+            merged = base + continuation[overlap:]
+        else:
+            merged = f"{base.rstrip()} {continuation.lstrip()}"
+
+        return re.sub(r"\n{3,}", "\n\n", merged).strip()
+
     def _clean_response(self, text: str) -> str:
         cleaned = text.strip()
+        cleaned = re.sub(r"<\|turn\>|<turn\|>", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"<\|channel\>thought\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"<channel\|>", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"<end[_ ]of[_ ]turn>", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"<start[_ ]of[_ ]turn>\s*model", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"<mid[_-]of[_-]turn[^>\n]*>", "", cleaned, flags=re.IGNORECASE)
@@ -557,8 +638,6 @@ class GemmaRuntime:
         if re.search(r"\b([A-Za-z])(?:\s+\1){8,}\b", normalized):
             return True
         tokens = re.findall(r"[A-Za-z0-9']+", normalized.lower())
-        if len(tokens) < 5:
-            return True
         if len(tokens) >= 12:
             counts = Counter(tokens)
             token, frequency = counts.most_common(1)[0]
@@ -569,6 +648,33 @@ class GemmaRuntime:
             if len(set(tokens)) <= 3 and len(tokens) >= 18:
                 return True
         if normalized.endswith("..."):
+            return True
+        return False
+
+    def _needs_retry(self, text: str) -> bool:
+        normalized = " ".join(text.strip().split())
+        if not normalized:
+            return True
+        lowered = normalized.lower()
+        if "<turn|>" in normalized or "<|turn>" in normalized or "<channel|>" in normalized or "<|channel>" in normalized:
+            return True
+        if lowered.startswith("i hit a bad completion on that turn"):
+            return True
+        return False
+
+    def _looks_truncated(self, text: str, completion_tokens: int, budget: int) -> bool:
+        normalized = " ".join(text.strip().split())
+        if not normalized:
+            return False
+        if completion_tokens >= (budget - 6):
+            return True
+        if re.search(r"\*\*[^*]*$", normalized):
+            return True
+        if re.search(r"(?:^|\s)\d+\.\s+\*{0,2}[A-Za-z][A-Za-z\s-]{0,24}$", normalized):
+            return True
+        if re.search(r"[:;,]\s*$", normalized):
+            return True
+        if len(normalized) > 120 and not re.search(r"[.!?][\"')\]]?\s*$", normalized):
             return True
         return False
 
@@ -938,8 +1044,9 @@ class Store:
                 continue
             if i + 1 < len(rows) and rows[i + 1]["role"] == "assistant":
                 assistant = rows[i + 1]
+                stable.append(row)
                 if self._is_visible_chat_turn(assistant):
-                    stable.extend([row, assistant])
+                    stable.append(assistant)
                 i += 2
                 continue
             stable.append(row)

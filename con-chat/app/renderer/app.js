@@ -3,6 +3,8 @@ const state = {
   currentTokens: 0,
   maxTokens: 32768,
   messages: [],
+  bootstrapReady: false,
+  sending: false,
   graphNodes: [],
   graphEdges: [],
   graphTransform: {
@@ -113,10 +115,110 @@ async function fetchJson(url, options) {
   return await response.json();
 }
 
+async function copyText(text) {
+  const listener = (event) => {
+    event.preventDefault();
+    event.clipboardData?.setData("text/plain", text);
+  };
+
+  try {
+    document.addEventListener("copy", listener);
+    if (document.queryCommandSupported?.("copy")) {
+      const host = document.createElement("div");
+      host.contentEditable = "true";
+      host.setAttribute("aria-hidden", "true");
+      host.style.position = "fixed";
+      host.style.top = "0";
+      host.style.left = "-9999px";
+      host.style.opacity = "0";
+      host.textContent = text;
+      document.body.appendChild(host);
+
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(host);
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+
+      const ok = document.execCommand("copy");
+      selection?.removeAllRanges();
+      host.remove();
+      if (ok) {
+        return true;
+      }
+    }
+  } catch (_error) {
+    // Fall through.
+  } finally {
+    document.removeEventListener("copy", listener);
+  }
+
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (_error) {
+      // Fall through to textarea-based copy for embedded browsers that deny clipboard API.
+    }
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.top = "-1000px";
+  textarea.style.left = "-1000px";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+  textarea.setSelectionRange(0, textarea.value.length);
+
+  let ok = false;
+  try {
+    ok = document.execCommand("copy");
+  } catch (_error) {
+    ok = false;
+  } finally {
+    textarea.remove();
+  }
+  if (ok) {
+    return true;
+  }
+
+  try {
+    const selection = window.getSelection();
+    const range = document.createRange();
+    const helper = document.createElement("div");
+    helper.textContent = text;
+    helper.style.position = "fixed";
+    helper.style.top = "0";
+    helper.style.left = "-9999px";
+    document.body.appendChild(helper);
+    range.selectNodeContents(helper);
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    window.setTimeout(() => helper.remove(), 1500);
+    return false;
+  } catch (_error) {
+    return false;
+  }
+}
+
 const bridge = window.conChat ?? createHttpBridge();
 
 function byId(id) {
   return document.getElementById(id);
+}
+
+function setComposerDisabled(disabled) {
+  const input = byId("composer-input");
+  const button = byId("composer-submit");
+  if (!input || !button) {
+    return;
+  }
+  input.disabled = disabled;
+  button.disabled = disabled;
 }
 
 function escapeHtml(text) {
@@ -140,22 +242,91 @@ function renderMarkdown(text) {
     return "";
   }
 
-  const blocks = normalized.split(/\n{2,}/).map((block) => block.trim()).filter(Boolean);
-  return blocks.map((block) => {
-    if (block.startsWith("- ")) {
-      const items = block
-        .split("\n")
-        .filter((line) => line.startsWith("- "))
-        .map((line) => `<li>${renderInlineMarkdown(line.slice(2).trim())}</li>`)
-        .join("");
-      return `<ul>${items}</ul>`;
+  const lines = normalized.split("\n");
+  const blocks = [];
+  let index = 0;
+
+  const consumeParagraph = () => {
+    const content = [];
+    while (index < lines.length && lines[index].trim()) {
+      const line = lines[index];
+      if (
+        /^#{1,6}\s+/.test(line) ||
+        /^(?:- |\* )/.test(line) ||
+        /^\d+\.\s+/.test(line) ||
+        line.trim() === "```"
+      ) {
+        break;
+      }
+      content.push(line.trimEnd());
+      index += 1;
     }
-    if (block.startsWith("```") && block.endsWith("```")) {
-      const code = block.replace(/^```[\w-]*\n?/, "").replace(/\n?```$/, "");
-      return `<pre><code>${escapeHtml(code)}</code></pre>`;
+    if (content.length) {
+      blocks.push(`<p>${content.map((part) => renderInlineMarkdown(part)).join("<br>")}</p>`);
     }
-    return `<p>${renderInlineMarkdown(block).replace(/\n/g, "<br>")}</p>`;
-  }).join("");
+  };
+
+  while (index < lines.length) {
+    const rawLine = lines[index];
+    const line = rawLine.trim();
+
+    if (!line) {
+      index += 1;
+      continue;
+    }
+
+    if (line.startsWith("```")) {
+      index += 1;
+      const codeLines = [];
+      while (index < lines.length && !lines[index].trim().startsWith("```")) {
+        codeLines.push(lines[index]);
+        index += 1;
+      }
+      if (index < lines.length) {
+        index += 1;
+      }
+      blocks.push(`<pre><code>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
+      continue;
+    }
+
+    const headingMatch = line.match(/^(#{1,6})\s+(.+)$/);
+    if (headingMatch) {
+      const level = Math.min(headingMatch[1].length, 6);
+      blocks.push(`<h${level}>${renderInlineMarkdown(headingMatch[2].trim())}</h${level}>`);
+      index += 1;
+      continue;
+    }
+
+    if (/^(?:- |\* )/.test(line)) {
+      const items = [];
+      while (index < lines.length && /^(?:- |\* )/.test(lines[index].trim())) {
+        items.push(`<li>${renderInlineMarkdown(lines[index].trim().slice(2).trim())}</li>`);
+        index += 1;
+      }
+      blocks.push(`<ul>${items.join("")}</ul>`);
+      continue;
+    }
+
+    if (/^\d+\.\s+/.test(line)) {
+      const items = [];
+      while (index < lines.length && /^\d+\.\s+/.test(lines[index].trim())) {
+        items.push(`<li>${renderInlineMarkdown(lines[index].trim().replace(/^\d+\.\s+/, "").trim())}</li>`);
+        index += 1;
+      }
+      blocks.push(`<ol>${items.join("")}</ol>`);
+      continue;
+    }
+
+    if (line === "---") {
+      blocks.push("<hr>");
+      index += 1;
+      continue;
+    }
+
+    consumeParagraph();
+  }
+
+  return blocks.join("");
 }
 
 function applyGraphTransform(group) {
@@ -295,6 +466,8 @@ function applyBootstrap(initial) {
   state.graphNodes = initial.graph.nodes;
   state.graphEdges = initial.graph.edges;
   setBudget(initial.conversation.currentTokens, initial.conversation.maxTokens);
+  state.bootstrapReady = true;
+  setComposerDisabled(false);
   renderMessages(state.messages);
   drawGraph();
 }
@@ -317,11 +490,16 @@ function bindComposer() {
 
   byId("composer").addEventListener("submit", async (event) => {
     event.preventDefault();
+    if (!state.bootstrapReady || state.sending) {
+      return;
+    }
     const text = input.value.trim();
     if (!text) {
       return;
     }
 
+    state.sending = true;
+    setComposerDisabled(true);
     const pendingMessage = {
       id: `pending-${Date.now()}`,
       role: "user",
@@ -350,6 +528,8 @@ function bindComposer() {
     } catch (_error) {
       state.messages = state.messages.filter((message) => message.id !== pendingMessage.id && message.id !== pendingAssistant.id);
       renderMessages(state.messages);
+      state.sending = false;
+      setComposerDisabled(false);
       return;
     }
 
@@ -367,6 +547,8 @@ function bindComposer() {
     state.graphEdges = result.graph.edges;
     renderMessages(state.messages);
     drawGraph();
+    state.sending = false;
+    setComposerDisabled(false);
   });
 
   byId("thread").addEventListener("click", async (event) => {
@@ -376,7 +558,14 @@ function bindComposer() {
     }
     const text = button.getAttribute("data-copy") || "";
     try {
-      await navigator.clipboard.writeText(text);
+      const ok = await copyText(text);
+      if (!ok) {
+        button.textContent = "Press Cmd+C";
+        window.setTimeout(() => {
+          button.textContent = "Copy";
+        }, 1800);
+        return;
+      }
       button.textContent = "Copied";
       window.setTimeout(() => {
         button.textContent = "Copy";
@@ -461,6 +650,9 @@ function bindGraphControls() {
   });
 
   byId("conversation-reset").addEventListener("click", async () => {
+    if (state.sending) {
+      return;
+    }
     let result;
     try {
       result = await bridge.resetConversation();
@@ -479,6 +671,7 @@ function bindGraphControls() {
 }
 
 async function bootstrap() {
+  setComposerDisabled(true);
   let initial;
   try {
     initial = await bridge.bootstrapState();
