@@ -861,6 +861,84 @@ def trace_generate_sweep(
     console.print(summary_table)
 
 
+@app.command("trace-compact-sweep")
+def trace_compact_sweep(
+    model_name_or_path: str = typer.Option(..., help="Transformers model id or local path."),
+    prompt: str = typer.Option(..., help="Prompt to trace and compact-replay from."),
+    boundary_layer: int = typer.Option(..., help="Boundary layer where the compact object starts."),
+    replay_layer: int = typer.Option(..., help="Later layer reconstructed from the compact object."),
+    delta_depths: str = typer.Option(
+        "0,1,2,4",
+        help="Comma-separated counts of trailing deltas to keep between boundary and replay layer.",
+    ),
+    top_k: int = typer.Option(5, min=1, help="Top-k width used for overlap scoring."),
+    token_index: int = typer.Option(-1, help="Token index to reconstruct; defaults to the last prompt token."),
+    device: str = typer.Option("cpu", help="Torch device for the HF trace backend."),
+    dtype: str = typer.Option("auto", help="Torch dtype: auto, float32, float16, or bfloat16."),
+) -> None:
+    parsed_delta_depths = parse_int_list(delta_depths, unique=True, ascending=True)
+
+    runner = HFTraceRunner(
+        model_name_or_path=model_name_or_path,
+        device=device,
+        dtype=dtype,
+    )
+    result = runner.compare_compact_replay_variants(
+        text=prompt,
+        boundary_layer=boundary_layer,
+        replay_layer=replay_layer,
+        delta_depths=parsed_delta_depths,
+        top_k=top_k,
+        token_index=token_index,
+    )
+
+    console.print(
+        "[bold]HF Compact Replay Sweep[/bold]\n"
+        "Measures how much target-token replay state can be dropped before next-token behavior diverges from the exact replay baseline."
+    )
+    console.print(f"Backend: {runner.backend}")
+    console.print(f"Model: {runner.model_name_or_path}")
+    console.print(f"Boundary layer: {result['boundary_layer']}")
+    console.print(f"Replay layer: {result['replay_layer']}")
+    console.print(f"Token index: {result['token_index']}")
+    console.print(
+        "Available delta layers: "
+        + ", ".join(str(layer) for layer in result["available_delta_layers"])
+    )
+
+    table = Table(title="Compact Replay Variants")
+    table.add_column("Delta Depth")
+    table.add_column("Kept Layers")
+    table.add_column("Bytes")
+    table.add_column("Token Match")
+    table.add_column(f"Top-{top_k}")
+    table.add_column("L2")
+    table.add_column("Max Abs Diff")
+    table.add_column("Compact Token")
+    for row in result["rows"]:
+        kept_layers = ",".join(str(layer) for layer in row["kept_layers"]) or "-"
+        table.add_row(
+            str(row["delta_depth"]),
+            kept_layers,
+            str(row["compact_bytes"]),
+            "yes" if row["token_match"] else "no",
+            f"{row['topk_overlap']}/{row['topk_size']}",
+            f"{row['l2_error']:.8f}",
+            f"{row['max_abs_diff']:.8f}",
+            f"{row['compact_token_id']} {row['compact_token_text']!r}",
+        )
+    console.print(table)
+
+    if result["rows"]:
+        reference = result["rows"][-1]
+        metrics = Table(title="Compact Object Size Reference")
+        metrics.add_column("Metric")
+        metrics.add_column("Bytes")
+        metrics.add_row("Exact replay token", str(reference["full_replay_token_bytes"]))
+        metrics.add_row("Full boundary+delta trace", str(reference["full_trace_bytes"]))
+        console.print(metrics)
+
+
 @app.command("trace-generate-kv-verify")
 def trace_generate_kv_verify(
     model_name_or_path: str = typer.Option(..., help="Transformers model id or local path."),
@@ -1050,6 +1128,128 @@ def trace_generate_kv_three_path(
             f"{row['bc_l2']:.8f}",
         )
     console.print(layer_table)
+
+
+@app.command("trace-generate-kv-operational")
+def trace_generate_kv_operational(
+    model_name_or_path: str = typer.Option(..., help="Transformers model id or local path."),
+    prompt: str = typer.Option(..., help="Prompt to trace and continue from."),
+    boundary_layer: int = typer.Option(..., help="Logical layer whose output becomes the injected boundary state."),
+    steps: int = typer.Option(20, min=1, help="Greedy continuation horizon."),
+    top_k: int = typer.Option(5, min=1, help="Top-k width used for overlap scoring."),
+    device: str = typer.Option("cpu", help="Torch device for the HF trace backend."),
+    dtype: str = typer.Option("auto", help="Torch dtype: auto, float32, float16, or bfloat16."),
+) -> None:
+    runner = HFTraceRunner(
+        model_name_or_path=model_name_or_path,
+        device=device,
+        dtype=dtype,
+    )
+    result = runner.compare_greedy_continuation_kv_operational(
+        text=prompt,
+        boundary_layer=boundary_layer,
+        steps=steps,
+        top_k=top_k,
+    )
+
+    console.print(
+        "[bold]HF KV Operational Comparison[/bold]\n"
+        "Compares the fast KV-aware path against the frozen exact baseline on greedy continuation behavior."
+    )
+    console.print(f"Backend: {runner.backend}")
+    console.print(f"Model: {runner.model_name_or_path}")
+    console.print(f"Boundary layer: {result['boundary_layer']}")
+    console.print(f"Steps requested: {result['steps_requested']}")
+    console.print(f"Steps completed: {result['steps_completed']}")
+    console.print(f"Token agreement: {result['token_agreement']:.2f}")
+    console.print(
+        "First divergence step: "
+        + ("none" if result["first_divergence_step"] is None else str(result["first_divergence_step"]))
+    )
+
+    metrics = Table(title="Operational Summary")
+    metrics.add_column("Metric")
+    metrics.add_column("Value")
+    metrics.add_row("Exact latency / step ms", f"{result['exact_latency_per_step_ms']:.2f}")
+    metrics.add_row("KV latency / step ms", f"{result['kv_latency_per_step_ms']:.2f}")
+    metrics.add_row("Final cache bytes", str(result["final_cache_bytes"]))
+    console.print(metrics)
+
+    step_table = Table(title="Per-Step Operational Agreement")
+    step_table.add_column("Step")
+    step_table.add_column("Token Match")
+    step_table.add_column(f"Top-{top_k} Overlap")
+    step_table.add_column("Exact Token")
+    step_table.add_column("KV Token")
+    for row in result["per_step"]:
+        step_table.add_row(
+            str(row["step"]),
+            "yes" if row["token_match"] else "no",
+            f"{row['topk_overlap']}/{row['topk_size']}",
+            f"{row['exact_token_id']} {row['exact_token_text']!r}",
+            f"{row['kv_token_id']} {row['kv_token_text']!r}",
+        )
+    console.print(step_table)
+
+
+@app.command("trace-generate-kv-sweep")
+def trace_generate_kv_sweep(
+    model_name_or_path: str = typer.Option(..., help="Transformers model id or local path."),
+    prompt: str = typer.Option(..., help="Prompt to trace and continue from."),
+    boundary_layers: str = typer.Option("0,6,10", help="Comma-separated boundary layers to test."),
+    step_values: str = typer.Option("20,50", help="Comma-separated greedy continuation horizons to test."),
+    top_k: int = typer.Option(5, min=1, help="Top-k width used for overlap scoring."),
+    device: str = typer.Option("cpu", help="Torch device for the HF trace backend."),
+    dtype: str = typer.Option("auto", help="Torch dtype: auto, float32, float16, or bfloat16."),
+) -> None:
+    parsed_boundary_layers = parse_int_list(boundary_layers, unique=True, ascending=True)
+    parsed_step_values = parse_int_list(step_values, unique=True, ascending=True)
+
+    runner = HFTraceRunner(
+        model_name_or_path=model_name_or_path,
+        device=device,
+        dtype=dtype,
+    )
+
+    console.print(
+        "[bold]HF KV Operational Sweep[/bold]\n"
+        "Maps behavioral agreement between the frozen exact baseline and the kv_fast path across selected boundaries and horizons."
+    )
+    console.print(f"Backend: {runner.backend}")
+    console.print(f"Model: {runner.model_name_or_path}")
+    console.print(f"Prompt: {prompt!r}")
+
+    table = Table(title="KV Fast Operational Envelope")
+    table.add_column("Boundary")
+    table.add_column("Steps")
+    table.add_column("Token Agreement")
+    table.add_column(f"Top-{top_k}")
+    table.add_column("First Divergence")
+    table.add_column("Exact ms/step")
+    table.add_column("KV ms/step")
+    table.add_column("Cache Bytes")
+
+    for boundary_layer in parsed_boundary_layers:
+        for step_count in parsed_step_values:
+            result = runner.compare_greedy_continuation_kv_operational(
+                text=prompt,
+                boundary_layer=boundary_layer,
+                steps=step_count,
+                top_k=top_k,
+            )
+            full_topk_steps = sum(1 for row in result["per_step"] if row["topk_overlap"] == row["topk_size"])
+            table.add_row(
+                str(boundary_layer),
+                str(step_count),
+                f"{result['token_agreement']:.2f}",
+                f"{full_topk_steps}/{result['steps_completed']}",
+                "-" if result["first_divergence_step"] is None else str(result["first_divergence_step"]),
+                f"{result['exact_latency_per_step_ms']:.2f}",
+                f"{result['kv_latency_per_step_ms']:.2f}",
+                str(result["final_cache_bytes"]),
+            )
+
+    console.print(table)
 
 
 @app.command()

@@ -461,6 +461,126 @@ class HFTraceRunner:
             "resumed_top_k": self._top_k_tokens(resumed_logits, top_k=top_k),
         }
 
+    def compare_compact_replay_variants(
+        self,
+        *,
+        text: str,
+        boundary_layer: int,
+        replay_layer: int,
+        delta_depths: list[int],
+        top_k: int = 5,
+        token_index: int = -1,
+    ) -> dict[str, object]:
+        session = self.trace_text(text)
+        transformer = self._require_gpt2_model()
+        num_layers = len(transformer.h)
+        if boundary_layer < -1 or boundary_layer >= num_layers:
+            raise ValueError(
+                f"boundary_layer must be between -1 and {num_layers - 1}, got {boundary_layer}."
+            )
+        if replay_layer <= boundary_layer or replay_layer >= num_layers:
+            raise ValueError(
+                f"replay_layer must be between {boundary_layer + 1} and {num_layers - 1}, got {replay_layer}."
+            )
+
+        resolved_token_index = token_index if token_index >= 0 else session.token_count + token_index
+        if resolved_token_index < 0 or resolved_token_index >= session.token_count:
+            raise ValueError(
+                f"Token index {token_index} resolves to {resolved_token_index}, "
+                f"but the prompt has {session.token_count} tokens."
+            )
+
+        encoded = self._encode_text(text)
+        attention_mask_tensor = encoded["attention_mask"]
+        attention_mask_list = attention_mask_tensor[0].detach().cpu().tolist()
+
+        exact_replay_hidden = np.asarray(session.layer_states[replay_layer], dtype=np.float32).copy()
+        exact_logits = self.predict_from_hidden(
+            hidden_state=exact_replay_hidden,
+            start_layer=replay_layer + 1,
+            attention_mask=attention_mask_list,
+            target_token_index=-1,
+        )
+        exact_token_id = int(np.argmax(exact_logits))
+        exact_top_k = self._top_k_tokens(exact_logits, top_k=top_k)
+
+        token_boundary_state = np.asarray(session.layer_states[boundary_layer][resolved_token_index], dtype=np.float32).copy()
+        full_delta_layers = list(range(boundary_layer + 1, replay_layer + 1))
+        token_deltas = {
+            layer: (
+                np.asarray(session.layer_states[layer][resolved_token_index], dtype=np.float32)
+                - np.asarray(session.layer_states[layer - 1][resolved_token_index], dtype=np.float32)
+            )
+            for layer in full_delta_layers
+        }
+
+        rows: list[dict[str, object]] = []
+        seen_depths: set[int] = set()
+        for raw_depth in delta_depths:
+            depth = int(raw_depth)
+            if depth < 0:
+                raise ValueError(f"delta depth must be non-negative, got {depth}.")
+            capped_depth = min(depth, len(full_delta_layers))
+            if capped_depth in seen_depths:
+                continue
+            seen_depths.add(capped_depth)
+
+            kept_layers = full_delta_layers[-capped_depth:] if capped_depth > 0 else []
+            reconstructed_token = token_boundary_state.copy()
+            for layer in kept_layers:
+                reconstructed_token += token_deltas[layer]
+
+            compact_hidden = exact_replay_hidden.copy()
+            compact_hidden[resolved_token_index] = reconstructed_token
+            compact_logits = self.predict_from_hidden(
+                hidden_state=compact_hidden,
+                start_layer=replay_layer + 1,
+                attention_mask=attention_mask_list,
+                target_token_index=-1,
+            )
+
+            delta = compact_logits - exact_logits
+            compact_token_id = int(np.argmax(compact_logits))
+            compact_top_k = self._top_k_tokens(compact_logits, top_k=top_k)
+            exact_top_ids = {row[0] for row in exact_top_k}
+            compact_top_ids = {row[0] for row in compact_top_k}
+            compact_bytes = int(token_boundary_state.nbytes + sum(token_deltas[layer].nbytes for layer in kept_layers))
+
+            rows.append(
+                {
+                    "delta_depth": capped_depth,
+                    "kept_layers": kept_layers,
+                    "compact_bytes": compact_bytes,
+                    "full_replay_token_bytes": int(exact_replay_hidden[resolved_token_index].nbytes),
+                    "full_trace_bytes": int(
+                        token_boundary_state.nbytes + sum(delta.nbytes for delta in token_deltas.values())
+                    ),
+                    "l2_error": float(np.linalg.norm(delta)),
+                    "cosine_similarity": float(
+                        np.dot(compact_logits, exact_logits) / (np.linalg.norm(compact_logits) * np.linalg.norm(exact_logits))
+                    ) if np.linalg.norm(compact_logits) and np.linalg.norm(exact_logits) else 0.0,
+                    "max_abs_diff": float(np.max(np.abs(delta))),
+                    "exact_token_id": exact_token_id,
+                    "exact_token_text": self.tokenizer.decode([exact_token_id]),
+                    "compact_token_id": compact_token_id,
+                    "compact_token_text": self.tokenizer.decode([compact_token_id]),
+                    "token_match": compact_token_id == exact_token_id,
+                    "topk_overlap": len(exact_top_ids & compact_top_ids),
+                    "topk_size": top_k,
+                    "exact_top_k": exact_top_k,
+                    "compact_top_k": compact_top_k,
+                }
+            )
+
+        rows.sort(key=lambda row: row["delta_depth"])
+        return {
+            "boundary_layer": boundary_layer,
+            "replay_layer": replay_layer,
+            "token_index": resolved_token_index,
+            "available_delta_layers": full_delta_layers,
+            "rows": rows,
+        }
+
     def compare_greedy_continuation(
         self,
         *,
@@ -707,6 +827,144 @@ class HFTraceRunner:
             "baseline_ms": baseline_ms,
             "kv_ms": kv_ms,
             "cache_bytes": self._cache_bytes(cache),
+            "per_step": per_step,
+        }
+
+    def compare_greedy_continuation_kv_operational(
+        self,
+        *,
+        text: str,
+        boundary_layer: int,
+        steps: int,
+        top_k: int = 5,
+    ) -> dict[str, object]:
+        exact_encoded = self._encode_text(text)
+        exact_input_ids = exact_encoded["input_ids"]
+        exact_attention_mask = exact_encoded["attention_mask"]
+
+        kv_input_ids = exact_encoded["input_ids"].clone()
+        kv_attention_mask = exact_encoded["attention_mask"].clone()
+
+        prefill_boundary_hidden = self.capture_boundary_hidden_from_inputs(
+            input_ids=kv_input_ids,
+            attention_mask=kv_attention_mask,
+            boundary_layer=boundary_layer,
+        )
+        prefill_hidden_tensor = self._torch.tensor(
+            prefill_boundary_hidden,
+            dtype=self.model_dtype,
+            device=self.device,
+        ).unsqueeze(0)
+        cache = self._make_dynamic_cache()
+        prefill_position_ids = self._build_position_ids(prefill_hidden_tensor.shape[1])
+
+        kv_started = perf_counter()
+        with self._torch.no_grad():
+            prefill_hidden, cache = self._run_upper_stack(
+                hidden_tensor=prefill_hidden_tensor,
+                start_layer=boundary_layer + 1,
+                attention_mask_tensor=kv_attention_mask,
+                position_ids=prefill_position_ids,
+                past_key_values=cache,
+                use_cache=True,
+            )
+            kv_logits = self.model.lm_head(prefill_hidden)[0, -1].detach().cpu().to(self._torch.float32).numpy()
+        kv_total_ms = (perf_counter() - kv_started) * 1000.0
+        exact_total_ms = 0.0
+
+        per_step: list[dict[str, object]] = []
+        first_divergence_step: int | None = None
+
+        for step in range(steps):
+            exact_started = perf_counter()
+            exact_logits = self._resumed_next_token_logits_from_inputs(
+                input_ids=exact_input_ids,
+                attention_mask=exact_attention_mask,
+                boundary_layer=boundary_layer,
+            )
+            exact_total_ms += (perf_counter() - exact_started) * 1000.0
+
+            exact_token_id = int(np.argmax(exact_logits))
+            kv_token_id = int(np.argmax(kv_logits))
+            token_match = exact_token_id == kv_token_id
+            if first_divergence_step is None and not token_match:
+                first_divergence_step = step + 1
+
+            exact_top_k = self._top_k_tokens(exact_logits, top_k=top_k)
+            kv_top_k = self._top_k_tokens(kv_logits, top_k=top_k)
+            exact_top_ids = {row[0] for row in exact_top_k}
+            kv_top_ids = {row[0] for row in kv_top_k}
+            topk_overlap = len(exact_top_ids & kv_top_ids)
+
+            per_step.append(
+                {
+                    "step": step + 1,
+                    "exact_token_id": exact_token_id,
+                    "exact_token_text": self.tokenizer.decode([exact_token_id]),
+                    "kv_token_id": kv_token_id,
+                    "kv_token_text": self.tokenizer.decode([kv_token_id]),
+                    "token_match": token_match,
+                    "topk_overlap": topk_overlap,
+                    "topk_size": top_k,
+                    "exact_top_k": exact_top_k,
+                    "kv_top_k": kv_top_k,
+                    "cache_bytes": self._cache_bytes(cache),
+                }
+            )
+
+            # Advance exact path with its own greedy token.
+            exact_next_token = self._torch.tensor([[exact_token_id]], device=self.device, dtype=exact_input_ids.dtype)
+            exact_next_mask = self._torch.ones((1, 1), device=self.device, dtype=exact_attention_mask.dtype)
+            exact_input_ids = self._torch.cat([exact_input_ids, exact_next_token], dim=1)
+            exact_attention_mask = self._torch.cat([exact_attention_mask, exact_next_mask], dim=1)
+
+            # Advance KV path with its own greedy token and cached upper-stack update.
+            kv_next_token = self._torch.tensor([[kv_token_id]], device=self.device, dtype=kv_input_ids.dtype)
+            kv_next_mask = self._torch.ones((1, 1), device=self.device, dtype=kv_attention_mask.dtype)
+            kv_input_ids = self._torch.cat([kv_input_ids, kv_next_token], dim=1)
+            kv_attention_mask = self._torch.cat([kv_attention_mask, kv_next_mask], dim=1)
+
+            kv_boundary_hidden = self.capture_boundary_hidden_from_inputs(
+                input_ids=kv_input_ids,
+                attention_mask=kv_attention_mask,
+                boundary_layer=boundary_layer,
+            )[-1:]
+            kv_hidden_tensor = self._torch.tensor(
+                kv_boundary_hidden,
+                dtype=self.model_dtype,
+                device=self.device,
+            ).unsqueeze(0)
+            kv_position_ids = self._torch.tensor([[kv_input_ids.shape[1] - 1]], device=self.device)
+
+            kv_step_started = perf_counter()
+            with self._torch.no_grad():
+                kv_hidden_tensor, cache = self._run_upper_stack(
+                    hidden_tensor=kv_hidden_tensor,
+                    start_layer=boundary_layer + 1,
+                    attention_mask_tensor=kv_attention_mask,
+                    position_ids=kv_position_ids,
+                    past_key_values=cache,
+                    use_cache=True,
+                )
+                kv_logits = self.model.lm_head(kv_hidden_tensor)[0, -1].detach().cpu().to(self._torch.float32).numpy()
+            kv_total_ms += (perf_counter() - kv_step_started) * 1000.0
+
+        exact_text = self.tokenizer.decode(exact_input_ids[0].detach().cpu().tolist())
+        kv_text = self.tokenizer.decode(kv_input_ids[0].detach().cpu().tolist())
+        token_matches = sum(1 for row in per_step if row["token_match"])
+        return {
+            "boundary_layer": boundary_layer,
+            "steps_requested": steps,
+            "steps_completed": len(per_step),
+            "token_agreement": token_matches / len(per_step) if per_step else 0.0,
+            "first_divergence_step": first_divergence_step,
+            "exact_total_ms": exact_total_ms,
+            "kv_total_ms": kv_total_ms,
+            "exact_latency_per_step_ms": exact_total_ms / len(per_step) if per_step else 0.0,
+            "kv_latency_per_step_ms": kv_total_ms / len(per_step) if per_step else 0.0,
+            "final_cache_bytes": self._cache_bytes(cache),
+            "exact_text": exact_text,
+            "kv_text": kv_text,
             "per_step": per_step,
         }
 

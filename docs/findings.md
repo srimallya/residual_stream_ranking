@@ -279,3 +279,399 @@ Interpretation:
 - for the tested step-2 cut, the full-sequence recompute path is not the source of the observed upper-stack drift
 - the current measurable error term is KV-specific on this cut
 - the highest-value remaining bug boundary is therefore still the first reused upper block, with the value path as the first observed nonzero mismatch
+
+### KV Diagnosis: The First KV-Specific Mismatch Is Before Cache Append
+
+At step 2, layer `7`, the same last-token `ln_1` output was fed through `c_attn` in two ways:
+
+- as part of the full resumed sequence
+- as a single-token resumed input for the KV-aware step
+
+Observed result:
+
+- `ln_1` last-token input: exact
+- fused `c_attn` output: nonzero difference
+- `Q` slice: exact
+- `K` slice: exact
+- `V` slice: first nonzero difference
+- formatted `V`: same nonzero difference as the raw `V` slice
+
+Representative numbers:
+
+- fused `c_attn` last-token diff:
+  - `L2 ~= 5.52e-06`
+  - `max_abs_diff ~= 1.19e-06`
+- `V` slice diff:
+  - same as fused output diff
+- `Q` and `K` slice diffs:
+  - `0.0`
+
+Interpretation:
+
+- the first measurable KV-specific mismatch is not in cache append/readback
+- it appears earlier, at the fused attention projection when the same token is evaluated in:
+  - full-sequence mode
+  - versus single-token resumed mode
+- the mismatch is highly specific to the value path; query and key remain exact
+
+Updated bug boundary:
+
+- same hidden state
+- same layernorm output
+- different fused `c_attn` value segment depending on execution mode
+
+This makes the next question more precise:
+
+- why does the GPT-2 `c_attn` path produce a slightly different `V` slice for the same token when evaluated as part of a full sequence versus as a single-token resumed input?
+
+### KV Diagnosis: Projection Artifact Survives Contiguity and Manual Checks
+
+Additional micro-tests on step 2 / layer `7`:
+
+- compared `c_attn(full_sequence)[:, -1, :]` against `c_attn(last_token_only)`
+- forced the last-token tensor through:
+  - direct view
+  - `.contiguous()`
+  - `.clone()`
+  - standalone one-token tensor
+- checked dtype, device, contiguity, and strides
+- compared `attn.c_attn(x)` against an explicit manual `torch.addmm(bias, x, weight)` on the one-token input
+
+Observed result:
+
+- the same tiny V-only mismatch survives all last-token tensor variants
+- `Q` remains exact
+- `K` remains exact
+- `V` remains the only differing slice
+- manual `addmm` matches the module output exactly for the one-token input
+
+Representative numbers:
+
+- fused `c_attn` last-token diff:
+  - `L2 ~= 5.52e-06`
+  - `max_abs_diff ~= 1.19e-06`
+- this same diff appears for:
+  - view
+  - contiguous copy
+  - clone
+  - standalone one-token tensor
+- module vs manual `addmm` on the one-token input:
+  - `L2 = 0.0`
+  - `max_abs_diff = 0.0`
+
+Interpretation:
+
+- the current mismatch is not explained by:
+  - non-contiguous input
+  - dtype mismatch
+  - device mismatch
+  - module-vs-manual linear implementation on the one-token path
+- the remaining effect is a shape-dependent projection artifact:
+  - the same token produces a slightly different fused value segment when projected as part of a longer sequence than when projected alone
+
+Practical read:
+
+- the KV path may already be as semantically correct as this projection behavior allows on the current backend
+- exact bit-level equality across full-sequence and one-token projection modes may not be attainable without forcing the same projection shape/path on both sides
+
+### KV Operational Comparison
+
+Operational comparison on prompt:
+
+```text
+The capital of France is
+```
+
+Boundary tested:
+
+- `6`
+
+Horizon tested:
+
+- `20`
+
+Comparison mode:
+
+- exact baseline follows its own greedy tokens
+- `kv_fast` follows its own greedy tokens
+- compare token agreement, top-k overlap, latency, and cache size
+
+Observed result:
+
+- token agreement: `1.00`
+- first divergence step: none observed
+- top-5 overlap: `5/5` at every tested step
+
+Representative performance numbers:
+
+- exact latency / step: `~20.73 ms`
+- `kv_fast` latency / step: `~6.77 ms`
+- final cache size: `768,000` bytes
+
+Interpretation:
+
+- despite the tiny shape-dependent fused projection drift, the current `kv_fast` path is behaviorally stable on the tested 20-step horizon
+- for this cut, the drift behaves like a numerical floor rather than an operational failure
+
+Current operational read:
+
+- exact baseline remains the gold correctness reference
+- `kv_fast` is now a plausible execution-faithful fast path with a known numerical caveat
+
+### KV Operational Envelope: Widened Sweep
+
+Widened operational sweeps were then run against the frozen exact baseline using:
+
+- boundaries: `0`, `6`, `10`
+- horizons: `20`, `50`
+- top-k: `5`
+
+Prompt:
+
+```text
+The capital of France is
+```
+
+Observed result across the full tested grid:
+
+- token agreement: `1.00` for every run
+- first divergence step: none observed
+- top-5 overlap: `5/5` at every tested step for every run
+
+Representative timing and memory:
+
+- boundary `0`, horizon `20`:
+  - exact latency / step: `~20.71 ms`
+  - `kv_fast` latency / step: `~11.35 ms`
+  - final cache size: `1,548,288` bytes
+- boundary `0`, horizon `50`:
+  - exact latency / step: `~29.16 ms`
+  - `kv_fast` latency / step: `~10.09 ms`
+  - final cache size: `3,717,120` bytes
+- boundary `6`, horizon `20`:
+  - exact latency / step: `~20.93 ms`
+  - `kv_fast` latency / step: `~5.98 ms`
+  - final cache size: `702,720` bytes
+- boundary `6`, horizon `50`:
+  - exact latency / step: `~26.81 ms`
+  - `kv_fast` latency / step: `~5.67 ms`
+  - final cache size: `1,689,600` bytes
+- boundary `10`, horizon `20`:
+  - exact latency / step: `~21.11 ms`
+  - `kv_fast` latency / step: `~3.34 ms`
+  - final cache size: `140,544` bytes
+- boundary `10`, horizon `50`:
+  - exact latency / step: `~28.67 ms`
+  - `kv_fast` latency / step: `~3.26 ms`
+  - final cache size: `337,920` bytes
+
+Second prompt:
+
+```text
+The capital of France is Paris and the capital of Japan is
+```
+
+Observed result across the same grid:
+
+- token agreement: `1.00` for every run
+- first divergence step: none observed
+- top-5 overlap: `5/5` at every tested step for every run
+
+Representative timing and memory:
+
+- boundary `0`, horizon `20`:
+  - exact latency / step: `~25.51 ms`
+  - `kv_fast` latency / step: `~12.16 ms`
+  - final cache size: `1,745,280` bytes
+- boundary `0`, horizon `50`:
+  - exact latency / step: `~31.62 ms`
+  - `kv_fast` latency / step: `~10.41 ms`
+  - final cache size: `4,190,208` bytes
+- boundary `6`, horizon `20`:
+  - exact latency / step: `~26.18 ms`
+  - `kv_fast` latency / step: `~5.97 ms`
+  - final cache size: `792,192` bytes
+- boundary `6`, horizon `50`:
+  - exact latency / step: `~30.17 ms`
+  - `kv_fast` latency / step: `~5.87 ms`
+  - final cache size: `1,904,640` bytes
+- boundary `10`, horizon `20`:
+  - exact latency / step: `~24.80 ms`
+  - `kv_fast` latency / step: `~3.46 ms`
+  - final cache size: `158,208` bytes
+- boundary `10`, horizon `50`:
+  - exact latency / step: `~31.79 ms`
+  - `kv_fast` latency / step: `~3.31 ms`
+  - final cache size: `380,160` bytes
+
+Interpretation:
+
+- the known `shape-dependent fused projection drift` remains numerically detectable in the microscope path
+- but across the widened operational envelope it still does not produce behavioral divergence
+- for the tested GPT-2-class Hugging Face path, `kv_fast` is now behaviorally validated across:
+  - boundaries `0`, `6`, `10`
+  - horizons `20`, `50`
+  - two prompts of different prefix lengths
+
+Updated operational read:
+
+- exact replay path remains the correctness baseline
+- `kv_fast` is substantially faster
+- `kv_fast` is behaviorally indistinguishable from the exact baseline on the current tested envelope
+- the remaining projection drift is best treated as a backend numerical floor unless a wider sweep proves otherwise
+
+### Compact Replay: First Narrow Sweep
+
+A first compact-replay experiment was added against the frozen exact baseline.
+
+Scope of the experiment:
+
+- model: repo-local `gpt2`
+- boundary layer: `6`
+- replay layer: `10`
+- token under replay: last prompt token
+- exact prefix states at replay layer are kept
+- only the target token replay object is compacted
+- compact variants keep the boundary token state plus the last `N` deltas between layers `7` and `10`
+
+This is intentionally narrow. The question is:
+
+- how much target-token replay state can be dropped before next-token behavior diverges from the exact replay baseline?
+
+Prompt:
+
+```text
+The capital of France is
+```
+
+Object sizes:
+
+- exact replay token at layer `10`: `3,072` bytes
+- full boundary-plus-delta trace from layers `6 -> 10`: `15,360` bytes
+
+Observed compact variants:
+
+- depth `0` (boundary only):
+  - object size: `3,072` bytes
+  - greedy token match: yes
+  - top-5 overlap: `3/5`
+  - very large logit drift
+- depth `1` (keep layer `10` delta only):
+  - object size: `6,144` bytes
+  - greedy token match: yes
+  - top-5 overlap: `3/5`
+- depth `2` (keep layers `9,10`):
+  - object size: `9,216` bytes
+  - greedy token match: yes
+  - top-5 overlap: `5/5`
+- depth `4` (keep layers `7,8,9,10`):
+  - object size: `15,360` bytes
+  - greedy token match: yes
+  - top-5 overlap: `5/5`
+  - residual logit drift remains tiny but nonzero
+
+Second prompt:
+
+```text
+The capital of France is Paris and the capital of Japan is
+```
+
+Observed compact variants:
+
+- depth `0` (boundary only):
+  - greedy token match: no
+  - top-5 overlap: `1/5`
+- depth `1` (keep layer `10` delta only):
+  - greedy token match: yes
+  - top-5 overlap: `2/5`
+- depth `2` (keep layers `9,10`):
+  - greedy token match: yes
+  - top-5 overlap: `4/5`
+- depth `4` (keep layers `7,8,9,10`):
+  - greedy token match: yes
+  - top-5 overlap: `5/5`
+  - residual logit drift remains tiny but nonzero
+
+Interpretation:
+
+- compact replay is now a real experimental branch rather than a roadmap bullet
+- boundary-only replay can preserve the greedy token on very easy prompts, but it is not fidelity-stable
+- keeping only the final late-layer delta is still too weak for top-k fidelity
+- keeping the last two deltas is enough to recover full top-5 overlap on the shorter prompt, but not yet on the longer one
+- the full local boundary-plus-delta trace is behaviorally aligned on both tested prompts, though still not bit-exact
+
+Current compact-replay read:
+
+- the minimal faithful replay object is smaller than "store everything blindly" but larger than boundary-only
+- fidelity appears to improve monotonically as more late-layer deltas are restored
+- the next useful move is to widen this compact sweep across:
+  - more prompts
+  - more boundary / replay cuts
+  - short continuation horizons rather than next-token only
+
+### Compact Replay: Replay-Layer Sweep
+
+The compact-replay sweep was then widened across replay layers `8`, `9`, `10`, and `11` while keeping:
+
+- boundary layer: `6`
+- token under replay: last prompt token
+- top-k width: `5`
+
+Prompts tested:
+
+```text
+The capital of France is
+The capital of France is Paris and the capital of Japan is
+Alice opened the red door and found a small brass key that
+```
+
+Observed pattern:
+
+- for replay layer `8`, keeping the full local delta band (`7,8`) was enough to recover full top-5 overlap on all three prompts
+- for replay layer `9`, keeping the full local delta band (`7,8,9`) was enough to recover full top-5 overlap on all three prompts
+- for replay layer `10`, keeping the full local delta band (`7,8,9,10`) was enough to recover full top-5 overlap on all three prompts
+- for replay layer `11`, keeping the full local delta band (`7,8,9,10,11`) was required to recover full top-5 overlap on all three prompts
+
+Representative sufficiency curve:
+
+- replay layer `8`:
+  - depth `0` or `1`: often preserves the greedy token, but top-5 overlap remains partial
+  - depth `2` (full band): reaches `5/5` top-5 overlap with tiny residual drift
+- replay layer `9`:
+  - intermediate depths are stronger than boundary-only but still lossy
+  - depth `3` (full band): reaches `5/5` top-5 overlap with tiny residual drift
+- replay layer `10`:
+  - depth `2` or `3` can already recover the greedy token and sometimes full top-5 overlap on easier prompts
+  - the narrative prompt remained unstable at intermediate depths even with `5/5` top-k overlap in one case
+  - depth `4` (full band): reaches `5/5` top-5 overlap with tiny residual drift
+- replay layer `11`:
+  - boundary-only and shallow delta bands often fail badly
+  - some prompts require the full five-delta local band before the greedy token recovers
+  - depth `5` (full band): reaches `5/5` top-5 overlap with tiny residual drift
+
+Important nuance:
+
+- the broad trend is monotone improvement as more late-layer deltas are restored
+- but greedy-token behavior at intermediate depths is not perfectly monotone
+- one clear example:
+  - narrative prompt at replay layer `10`
+  - depth `2` matched the greedy token
+  - depth `3` had `5/5` top-k overlap but the greedy token changed
+  - depth `4` restored both greedy-token match and full top-k overlap
+
+Interpretation:
+
+- the compact replay object is not just "boundary state plus a little bit more" in a smooth scalar sense
+- intermediate delta bands can preserve the candidate set while still perturbing the local ranking inside that set
+- deeper replay layers demand a correspondingly deeper late-delta band
+- for the tested prompts and cuts, the full local boundary-plus-delta band from boundary `6` up to replay layer `r` is behaviorally aligned at replay layers `8` through `11`
+
+Updated compact-replay read:
+
+- a local late-band trace is now a credible compact replay design
+- boundary-only replay is clearly insufficient once the task or replay layer gets harder
+- greedy-token recovery and top-k recovery are related but distinct compact-fidelity metrics
+- the next useful compact branch is horizon testing:
+  - take the strongest reduced objects
+  - run short continuation horizons against the exact baseline
+  - measure where the compact object stops being behaviorally faithful

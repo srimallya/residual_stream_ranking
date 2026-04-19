@@ -224,7 +224,19 @@ Verify phase 2A resumed execution for GPT-2-class decoder models:
   --boundary-layer 6
 ```
 
+Probe compact replay objects against the exact replay baseline:
+
+```bash
+.venv/bin/residual-lab trace-compact-sweep \
+  --model-name-or-path models/gpt2 \
+  --prompt "The capital of France is" \
+  --boundary-layer 6 \
+  --replay-layer 10 \
+  --delta-depths 0,1,2,4
+```
+
 `trace-verify` captures observed layer outputs for one token, stores the boundary state plus incremental deltas, and checks offline reconstruction. `trace-resume-verify` takes the next narrow step: inject a captured full-sequence boundary hidden state at one layer, run the remaining layers, and compare resumed logits against the direct pass for one target token.
+`trace-compact-sweep` asks a different question: if exact prefix states are kept, how many late-layer deltas for the target token must remain in the replay object before next-token behavior lines up with the exact replay baseline again?
 
 ## Interpreting Results
 
@@ -250,7 +262,7 @@ The current benchmark evidence supports this decomposition:
 - the Apollo benchmark is still a constructed harness, not a production task suite
 - quality depends heavily on the selected model and embedding behavior
 - true hidden-state injection is currently implemented only for a narrow GPT-2-class phase 2A verification path
-- next-token continuation after injected-state resume is not implemented yet
+- compact replay is currently a narrow target-token experiment, not yet a general continuation path
 - the bundled GGUF models are local dependencies and are not intended to be committed to git
 
 ## Roadmap
