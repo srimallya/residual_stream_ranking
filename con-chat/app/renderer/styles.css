@@ -91,6 +91,8 @@ body {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  -webkit-overflow-scrolling: touch;
+  scroll-behavior: smooth;
 }
 
 .thread::-webkit-scrollbar,
@@ -113,12 +115,54 @@ body {
   border: 1px solid var(--line);
 }
 
-.message p {
-  margin: 0;
+.message-body {
   font-size: 11px;
   overflow-wrap: anywhere;
   word-break: break-word;
   hyphens: auto;
+}
+
+.message-body p,
+.message-body ul,
+.message-body pre {
+  margin: 0;
+}
+
+.message-body p + p,
+.message-body p + ul,
+.message-body ul + p,
+.message-body pre + p,
+.message-body p + pre {
+  margin-top: 8px;
+}
+
+.message-body ul {
+  padding-left: 16px;
+}
+
+.message-body code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.95em;
+  background: rgba(17, 19, 24, 0.06);
+  padding: 1px 4px;
+  border-radius: 4px;
+}
+
+.message-body pre {
+  padding: 8px 10px;
+  background: rgba(17, 19, 24, 0.05);
+  border-radius: 4px;
+  overflow-x: auto;
+}
+
+.message-body pre code {
+  background: transparent;
+  padding: 0;
+}
+
+.message-body a {
+  color: inherit;
+  text-decoration: underline;
 }
 
 .message-actions {
@@ -160,6 +204,47 @@ body {
 
 .message.pending {
   opacity: 0.74;
+}
+
+.thinking-wrap {
+  margin-top: 2px;
+  margin-bottom: 2px;
+  max-height: 42px;
+  overflow: hidden;
+  transition: max-height 180ms ease, opacity 180ms ease, margin 180ms ease;
+}
+
+.thinking-wrap.collapsing {
+  max-height: 0;
+  opacity: 0;
+  margin-top: 0;
+  margin-bottom: 0;
+}
+
+.thinking-bubble {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(17, 19, 24, 0.04);
+  color: var(--muted);
+  font: 600 9px/1 var(--font-ui);
+  letter-spacing: 0.08em;
+  text-transform: lowercase;
+}
+
+.thinking-bubble::after {
+  content: "";
+  width: 18px;
+  height: 6px;
+  border-radius: 999px;
+  background:
+    radial-gradient(circle at 3px 3px, rgba(17, 19, 24, 0.66) 0 1.5px, transparent 1.6px),
+    radial-gradient(circle at 9px 3px, rgba(17, 19, 24, 0.66) 0 1.5px, transparent 1.6px),
+    radial-gradient(circle at 15px 3px, rgba(17, 19, 24, 0.66) 0 1.5px, transparent 1.6px);
+  animation: thinkingPulse 1s linear infinite;
 }
 
 .composer {
@@ -211,6 +296,12 @@ body {
   border: 1px solid var(--line);
 }
 
+@keyframes thinkingPulse {
+  0% { opacity: 0.35; }
+  50% { opacity: 1; }
+  100% { opacity: 0.35; }
+}
+
 .graph-rail {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
@@ -251,9 +342,12 @@ body {
 }
 
 .graph-stage {
+  position: relative;
   min-height: 0;
   overflow: auto;
   padding: 6px;
+  -webkit-overflow-scrolling: touch;
+  scroll-behavior: smooth;
 }
 
 .graph-canvas {
@@ -266,6 +360,30 @@ body {
     linear-gradient(90deg, rgba(11, 87, 208, 0.05) 1px, transparent 1px),
     white;
   background-size: 24px 24px;
+}
+
+.graph-tooltip {
+  position: absolute;
+  left: 0;
+  top: 0;
+  max-width: 180px;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.96);
+  color: var(--text);
+  font: 500 10px/1.35 var(--font-ui);
+  box-shadow: 0 8px 18px rgba(18, 22, 28, 0.08);
+  pointer-events: none;
+  opacity: 0;
+  transform: translate3d(10px, 10px, 0);
+  transition: opacity 120ms ease, transform 120ms ease;
+  z-index: 3;
+  white-space: normal;
+}
+
+.graph-tooltip.visible {
+  opacity: 1;
 }
 
 @media (max-width: 1100px) {

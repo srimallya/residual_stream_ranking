@@ -27,7 +27,21 @@ ORCHESTRATION_DEVICE = os.environ.get("CON_CHAT_ORCHESTRATION_DEVICE", "cpu")
 DEFAULT_CONVERSATION_ID = "demo-thread"
 MAX_TOKENS = 32768
 REPO_ROOT = Path(__file__).resolve().parents[2]
+ENTITY_STOPWORDS = {
+    "about", "after", "again", "also", "and", "answer", "are", "assist", "based", "because",
+    "been", "before", "being", "between", "build", "can", "chat", "con", "continue", "could",
+    "developed", "directly", "does", "each", "empty", "even", "first", "for", "from", "graph",
+    "have", "help", "here", "how", "into", "its", "just", "large", "like", "live", "make",
+    "memory", "message", "model", "need", "needs", "not", "now", "only", "other", "our",
+    "output", "page", "please", "prompt", "reasoning", "reply", "scroll", "send", "show",
+    "simply", "start", "state", "still", "system", "test", "that", "the", "their", "them",
+    "there", "these", "they", "this", "through", "turn", "user", "very", "want", "what",
+    "when", "where", "which", "who", "why", "with", "work", "would", "your", "important",
+}
 SYSTEM_PROMPT = """You are Conway, the assistant inside con-chat. Do not describe yourself as being made by Google or any other model vendor unless the user explicitly asks about the backend.
+By default, reply with the final answer only.
+Do not print internal reasoning, hidden analysis, thought traces, symbolic workspace headings, or scaffolding labels like "BOUNDARIES", "RELATIONS", "OBSERVED", "ANSWER", "model response", or "Thinking Process" unless the user explicitly asks to see symbolic reasoning.
+Do not echo the user's question before answering unless clarification is necessary.
 
 Core idea:
 - Treat nouns as knowledge boundaries.
@@ -290,6 +304,7 @@ class GraphNode:
     type: str
     x: int
     y: int
+    detail: str | None = None
 
 
 class GemmaRuntime:
@@ -366,7 +381,7 @@ class GemmaRuntime:
             inputs = model_inputs.to(self.actual_device)
             outputs = self.model.generate(
                 inputs,
-                max_new_tokens=80,
+                max_new_tokens=160,
                 do_sample=True,
                 temperature=0.68,
                 top_p=0.9,
@@ -390,7 +405,7 @@ class GemmaRuntime:
             with self.lock, torch.inference_mode():
                 retry_outputs = self.model.generate(
                     inputs,
-                    max_new_tokens=80,
+                    max_new_tokens=160,
                     do_sample=True,
                     temperature=0.82,
                     top_p=0.92,
@@ -414,12 +429,9 @@ class GemmaRuntime:
             with self.lock, torch.inference_mode():
                 fallback_outputs = self.model.generate(
                     fallback_inputs.to(self.actual_device),
-                    max_new_tokens=72,
-                    do_sample=True,
-                    temperature=0.78,
-                    top_p=0.92,
-                    top_k=48,
-                    repetition_penalty=1.18,
+                    max_new_tokens=120,
+                    do_sample=False,
+                    repetition_penalty=1.12,
                     no_repeat_ngram_size=3,
                     pad_token_id=self.tokenizer.eos_token_id,
                     eos_token_id=self.tokenizer.eos_token_id,
@@ -432,8 +444,9 @@ class GemmaRuntime:
             )
             completion_tokens = int(generated_ids.shape[-1])
 
-        if not assistant_text:
-            assistant_text = "I’m ready, but the model returned an empty completion."
+        if not assistant_text or self._is_degenerate_response(assistant_text):
+            assistant_text = self._safe_fallback_reply(turns[-1]["text"] if turns else "")
+            completion_tokens = self.count_tokens(assistant_text)
 
         return assistant_text, {
             "promptAssemblySeconds": round(prompt_seconds, 4),
@@ -472,6 +485,10 @@ class GemmaRuntime:
                 "Answer the user's question in 2 to 4 direct sentences.",
                 "Do not mention Google or a model vendor unless asked directly.",
                 "Do not repeat filler. Do not echo the prompt.",
+                "Do not show thinking, reasoning steps, headings, bullet plans, or symbolic scaffolding.",
+                "Do not number steps. Do not write labels like Analyze, Boundaries, Relations, or Answer.",
+                "Start directly with the answer sentence.",
+                "Return the final answer only.",
                 "<end_of_turn>",
                 "<start_of_turn>user",
                 user_text,
@@ -484,13 +501,26 @@ class GemmaRuntime:
         cleaned = text.strip()
         cleaned = re.sub(r"<end[_ ]of[_ ]turn>", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"<start[_ ]of[_ ]turn>\s*model", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"<mid[_-]of[_-]turn[^>\n]*>", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"_?start[_-][^>\s]*>", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"<e[_-]out>", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"^\s*(model response|thought|thinking process)\s*:?\s*$", "", cleaned, flags=re.IGNORECASE | re.MULTILINE)
         if "User:" in cleaned:
             cleaned = cleaned.split("User:", 1)[0].strip()
         if "System:" in cleaned:
             cleaned = cleaned.split("System:", 1)[0].strip()
+        if "\nthought\n" in cleaned.lower():
+            cleaned = cleaned.split("\n", 1)[-1].strip()
+        if "Model needs to continue" in cleaned:
+            cleaned = cleaned.split("Model needs to continue", 1)[0].strip()
         while cleaned.startswith("Assistant:"):
             cleaned = cleaned[len("Assistant:") :].strip()
         cleaned = cleaned.replace("\nAssistant:", "\n").strip()
+        answer_match = re.search(r"\bANSWER\b\s*:?\s*(.+)$", cleaned, flags=re.IGNORECASE | re.DOTALL)
+        if answer_match:
+            cleaned = answer_match.group(1).strip()
+        cleaned = re.sub(r"^\s*why\s+.+?\?\s*", "", cleaned, count=1, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
         return cleaned
 
     def _is_preview_artifact(self, text: str) -> bool:
@@ -502,6 +532,24 @@ class GemmaRuntime:
             return True
         lowered = normalized.lower()
         if "<end" in lowered or "<start" in lowered:
+            return True
+        if re.search(r"mid[_-]of[_-]turn", lowered):
+            return True
+        if "model needs to continue" in lowered:
+            return True
+        if lowered.startswith("thought ") or lowered.startswith("thought\n"):
+            return True
+        if "thinking process" in lowered or "model response" in lowered:
+            return True
+        if "boundaries" in lowered and "relations" in lowered:
+            return True
+        if "analyze the request" in lowered or "self-correction" in lowered:
+            return True
+        if "identify key boundaries" in lowered or "symbol creation" in lowered:
+            return True
+        if "possible interpretations" in lowered:
+            return True
+        if "developed by **google**" in lowered or "developed by google" in lowered:
             return True
         repeated_token = re.fullmatch(r"(\b\w+\b)(?:\s+\1){10,}", normalized, flags=re.IGNORECASE)
         if repeated_token:
@@ -535,6 +583,15 @@ class GemmaRuntime:
                 "I can explain ideas, compare options, help design systems, and work through ambiguity in plain language."
             )
         return None
+
+    def _safe_fallback_reply(self, user_text: str) -> str:
+        identity = self._identity_override(user_text)
+        if identity is not None:
+            return identity
+        return (
+            "I hit a bad completion on that turn. "
+            "Ask again in a slightly more specific way and I’ll answer directly."
+        )
 
 
 class Store:
@@ -677,7 +734,7 @@ class Store:
             for row in visible_turns
         ]
 
-        nodes = self._graph_nodes(turns, memory)
+        nodes, derived_edges = self._graph_nodes(visible_turns, memory)
         return {
             "conversation": {
                 "id": conversation["id"],
@@ -692,7 +749,7 @@ class Store:
                 "edges": [
                     {"from": row["from_id"], "to": row["to_id"], "type": row["edge_type"]}
                     for row in edges
-                ],
+                ] + derived_edges,
             },
         }
 
@@ -889,20 +946,51 @@ class Store:
             i += 1
         return stable
 
-    def _graph_nodes(self, turns: list[sqlite3.Row], memory: sqlite3.Row | None) -> list[GraphNode]:
+    def _graph_nodes(self, turns: list[sqlite3.Row], memory: sqlite3.Row | None) -> tuple[list[GraphNode], list[dict]]:
         nodes: list[GraphNode] = []
+        edges: list[dict] = []
         y = 72
-        visible_turns = self._stable_visible_turns(turns)[-5:]
+        visible_turns = turns[-5:]
         for row in visible_turns[:-1]:
-            nodes.append(GraphNode(row["id"], row["id"].replace("turn-", "Turn "), "turn", 72, y))
+            label = "Turn"
+            snippet = " ".join(row["text"].split())[:96].strip()
+            detail = f"{row['role'].title()} · {snippet}" if snippet else f"{row['role'].title()} turn"
+            nodes.append(GraphNode(row["id"], label, "turn", 72, y, detail))
             y += 78
         if memory:
-            nodes.append(GraphNode(memory["id"], "Memory", "memory", 196, 156))
+            nodes.append(GraphNode(memory["id"], "Memory", "memory", 196, 156, "Compacted memory object"))
         if visible_turns:
-            nodes.append(GraphNode(visible_turns[-1]["id"], "Active", "active", 72, max(320, y)))
+            active_row = visible_turns[-1]
+            active_detail = active_row["text"][:120].strip() or "Active turn"
+            nodes.append(GraphNode(active_row["id"], "Active", "active", 72, max(320, y), active_detail))
         if memory and visible_turns:
-            nodes.append(GraphNode(f"recall-{memory['id']}", "Recalled", "recalled", 196, max(364, y + 18)))
-        return nodes
+            nodes.append(GraphNode(f"recall-{memory['id']}", "Recalled", "recalled", 196, max(364, y + 18), "Memory recalled into the active thread"))
+
+        entity_terms = self._entity_terms(visible_turns)
+        entity_y = 86
+        for entity_index, (entity_label, turn_ids) in enumerate(entity_terms):
+            entity_id = f"entity-{entity_label}"
+            x = 206 if entity_index % 2 == 0 else 252
+            nodes.append(GraphNode(entity_id, entity_label, "entity", x, entity_y, f"Entity: {entity_label}"))
+            for turn_id in turn_ids:
+                edges.append({"from": turn_id, "to": entity_id, "type": "mentions"})
+            entity_y += 72 if entity_index % 2 else 34
+        return nodes, edges
+
+    def _entity_terms(self, turns: list[sqlite3.Row]) -> list[tuple[str, list[str]]]:
+        mentions: dict[str, list[str]] = {}
+        for row in turns:
+            if row["role"] != "user":
+                continue
+            words = {
+                token.lower()
+                for token in re.findall(r"[A-Za-z][A-Za-z'-]{2,}", row["text"])
+                if token.lower() not in ENTITY_STOPWORDS and len(token) >= 5
+            }
+            for word in sorted(words):
+                mentions.setdefault(word, []).append(row["id"])
+        ranked = sorted(mentions.items(), key=lambda item: (-len(item[1]), item[0]))[:6]
+        return [(label.title(), turn_ids) for label, turn_ids in ranked]
 
     def _memory_view(self, row: sqlite3.Row | None) -> dict | None:
         if row is None:
@@ -952,8 +1040,10 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
-        if parsed.path == f"/v1/conversations/{DEFAULT_CONVERSATION_ID}/graph":
-            self._send_json(200, STORE.conversation_snapshot(DEFAULT_CONVERSATION_ID))
+        graph_match = re.fullmatch(r"/v1/conversations/([^/]+)/graph", parsed.path)
+        if graph_match:
+            conversation_id = graph_match.group(1)
+            self._send_json(200, STORE.conversation_snapshot(conversation_id))
             return
 
         self._send_json(404, {"error": "not_found"})
@@ -973,9 +1063,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(500, {"error": "generation_failed", "detail": repr(exc)})
             return
 
-        if parsed.path == f"/v1/conversations/{DEFAULT_CONVERSATION_ID}/reset":
+        reset_match = re.fullmatch(r"/v1/conversations/([^/]+)/reset", parsed.path)
+        if reset_match:
             payload = self._read_json()
-            conversation_id = payload.get("conversationId", DEFAULT_CONVERSATION_ID)
+            conversation_id = payload.get("conversationId", reset_match.group(1))
             self._send_json(200, STORE.reset_conversation(conversation_id))
             return
 
