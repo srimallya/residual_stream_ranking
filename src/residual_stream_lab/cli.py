@@ -33,6 +33,17 @@ def parse_layer_spec(spec: str) -> list[int]:
     return values
 
 
+def parse_int_list(spec: str, *, unique: bool = False, ascending: bool = False) -> list[int]:
+    values = [int(value.strip()) for value in spec.split(",") if value.strip()]
+    if not values:
+        raise typer.BadParameter("Value list must contain at least one integer.")
+    if unique and len(set(values)) != len(values):
+        raise typer.BadParameter("Value list must be unique.")
+    if ascending and values != sorted(values):
+        raise typer.BadParameter("Value list must be sorted ascending.")
+    return values
+
+
 def expand_window_ids(
     selected_ids: list[int],
     *,
@@ -676,6 +687,369 @@ def trace_resume_verify(
     table.add_row("Max abs diff", f"{comparison['max_abs_diff']:.8f}")
     table.add_row("Vocab size", str(comparison["vocab_size"]))
     console.print(table)
+
+
+@app.command("trace-next-token-verify")
+def trace_next_token_verify(
+    model_name_or_path: str = typer.Option(..., help="Transformers model id or local path."),
+    prompt: str = typer.Option(..., help="Prompt to trace and resume."),
+    boundary_layer: int = typer.Option(..., help="Logical layer whose output becomes the injected boundary state."),
+    top_k: int = typer.Option(5, min=1, help="How many next-token candidates to display."),
+    device: str = typer.Option("cpu", help="Torch device for the HF trace backend."),
+    dtype: str = typer.Option("auto", help="Torch dtype: auto, float32, float16, or bfloat16."),
+) -> None:
+    runner = HFTraceRunner(
+        model_name_or_path=model_name_or_path,
+        device=device,
+        dtype=dtype,
+    )
+    comparison = runner.compare_next_token(
+        text=prompt,
+        boundary_layer=boundary_layer,
+        top_k=top_k,
+    )
+
+    console.print(
+        "[bold]HF Next-Token Verification[/bold]\n"
+        "Phase 2B check: compare direct next-token logits and greedy token against resumed execution from a boundary state."
+    )
+    console.print(f"Backend: {runner.backend}")
+    console.print(f"Model: {runner.model_name_or_path}")
+    console.print(f"Boundary layer: {comparison['boundary_layer']}")
+    console.print(f"Start layer: {comparison['start_layer']}")
+
+    metrics = Table(title="Next-Token Agreement")
+    metrics.add_column("Metric")
+    metrics.add_column("Value")
+    metrics.add_row("L2 error", f"{comparison['l2_error']:.8f}")
+    metrics.add_row("Cosine similarity", f"{comparison['cosine_similarity']:.8f}")
+    metrics.add_row("Max abs diff", f"{comparison['max_abs_diff']:.8f}")
+    metrics.add_row("Direct greedy id", str(comparison["direct_token_id"]))
+    metrics.add_row("Direct greedy text", repr(comparison["direct_token_text"]))
+    metrics.add_row("Resumed greedy id", str(comparison["resumed_token_id"]))
+    metrics.add_row("Resumed greedy text", repr(comparison["resumed_token_text"]))
+    metrics.add_row("Greedy match", "yes" if comparison["token_match"] else "no")
+    console.print(metrics)
+
+    top_table = Table(title="Top-K Next Tokens")
+    top_table.add_column("Rank")
+    top_table.add_column("Direct")
+    top_table.add_column("Resumed")
+    direct_top_k = comparison["direct_top_k"]
+    resumed_top_k = comparison["resumed_top_k"]
+    for index, (direct_row, resumed_row) in enumerate(zip(direct_top_k, resumed_top_k), start=1):
+        top_table.add_row(
+            str(index),
+            f"{direct_row[0]} {direct_row[1]!r} {direct_row[2]:.6f}",
+            f"{resumed_row[0]} {resumed_row[1]!r} {resumed_row[2]:.6f}",
+        )
+    console.print(top_table)
+
+
+@app.command("trace-generate-verify")
+def trace_generate_verify(
+    model_name_or_path: str = typer.Option(..., help="Transformers model id or local path."),
+    prompt: str = typer.Option(..., help="Prompt to trace and continue from."),
+    boundary_layer: int = typer.Option(..., help="Logical layer whose output becomes the injected boundary state."),
+    steps: int = typer.Option(8, min=1, help="Greedy continuation horizon."),
+    top_k: int = typer.Option(5, min=1, help="How many next-token candidates to display per step."),
+    device: str = typer.Option("cpu", help="Torch device for the HF trace backend."),
+    dtype: str = typer.Option("auto", help="Torch dtype: auto, float32, float16, or bfloat16."),
+) -> None:
+    runner = HFTraceRunner(
+        model_name_or_path=model_name_or_path,
+        device=device,
+        dtype=dtype,
+    )
+    result = runner.compare_greedy_continuation(
+        text=prompt,
+        boundary_layer=boundary_layer,
+        steps=steps,
+        top_k=top_k,
+    )
+
+    console.print(
+        "[bold]HF Generation Verification[/bold]\n"
+        "Phase 2C check: greedy short-horizon continuation from a boundary state, compared step by step against direct generation."
+    )
+    console.print(f"Backend: {runner.backend}")
+    console.print(f"Model: {runner.model_name_or_path}")
+    console.print(f"Boundary layer: {result['boundary_layer']}")
+    console.print(f"Steps requested: {result['steps_requested']}")
+    console.print(f"Steps completed: {result['steps_completed']}")
+    console.print(f"Exact continuation match: {'yes' if result['exact_match'] else 'no'}")
+    if result["first_divergence_step"] is not None:
+        console.print(f"First divergence step: {result['first_divergence_step']}")
+    console.print(f"Generated text: {result['generated_text']!r}")
+
+    table = Table(title="Per-Step Agreement")
+    table.add_column("Step")
+    table.add_column("L2")
+    table.add_column("Cos")
+    table.add_column("Max Abs Diff")
+    table.add_column("Greedy Match")
+    table.add_column("Direct Token")
+    table.add_column("Resumed Token")
+    for step in result["per_step"]:
+        table.add_row(
+            str(step["step"]),
+            f"{step['l2_error']:.8f}",
+            f"{step['cosine_similarity']:.8f}",
+            f"{step['max_abs_diff']:.8f}",
+            "yes" if step["token_match"] else "no",
+            f"{step['direct_token_id']} {step['direct_token_text']!r}",
+            f"{step['resumed_token_id']} {step['resumed_token_text']!r}",
+        )
+    console.print(table)
+
+
+@app.command("trace-generate-sweep")
+def trace_generate_sweep(
+    model_name_or_path: str = typer.Option(..., help="Transformers model id or local path."),
+    prompt: str = typer.Option(..., help="Prompt to trace and continue from."),
+    boundary_layers: str = typer.Option("0,6,10", help="Comma-separated boundary layers to test."),
+    step_values: str = typer.Option("5,10,20", help="Comma-separated greedy continuation horizons to test."),
+    top_k: int = typer.Option(3, min=1, help="How many next-token candidates to retain in backend comparisons."),
+    device: str = typer.Option("cpu", help="Torch device for the HF trace backend."),
+    dtype: str = typer.Option("auto", help="Torch dtype: auto, float32, float16, or bfloat16."),
+) -> None:
+    parsed_boundary_layers = parse_int_list(boundary_layers, unique=True, ascending=True)
+    parsed_step_values = parse_int_list(step_values, unique=True, ascending=True)
+
+    runner = HFTraceRunner(
+        model_name_or_path=model_name_or_path,
+        device=device,
+        dtype=dtype,
+    )
+
+    console.print(
+        "[bold]HF Generation Sweep[/bold]\n"
+        "Maps exact greedy continuation stability across selected boundary layers and step horizons."
+    )
+    console.print(f"Backend: {runner.backend}")
+    console.print(f"Model: {runner.model_name_or_path}")
+    console.print(f"Prompt: {prompt!r}")
+
+    summary_table = Table(title="Continuation Stability")
+    summary_table.add_column("Boundary")
+    summary_table.add_column("Steps")
+    summary_table.add_column("Exact")
+    summary_table.add_column("Completed")
+    summary_table.add_column("First Divergence")
+    summary_table.add_column("Final Direct Token")
+    summary_table.add_column("Final Resumed Token")
+
+    for boundary_layer in parsed_boundary_layers:
+        for step_count in parsed_step_values:
+            result = runner.compare_greedy_continuation(
+                text=prompt,
+                boundary_layer=boundary_layer,
+                steps=step_count,
+                top_k=top_k,
+            )
+            last_step = result["per_step"][-1] if result["per_step"] else None
+            summary_table.add_row(
+                str(boundary_layer),
+                str(step_count),
+                "yes" if result["exact_match"] else "no",
+                str(result["steps_completed"]),
+                "-" if result["first_divergence_step"] is None else str(result["first_divergence_step"]),
+                "-" if last_step is None else f"{last_step['direct_token_id']} {last_step['direct_token_text']!r}",
+                "-" if last_step is None else f"{last_step['resumed_token_id']} {last_step['resumed_token_text']!r}",
+            )
+
+    console.print(summary_table)
+
+
+@app.command("trace-generate-kv-verify")
+def trace_generate_kv_verify(
+    model_name_or_path: str = typer.Option(..., help="Transformers model id or local path."),
+    prompt: str = typer.Option(..., help="Prompt to trace and continue from."),
+    boundary_layer: int = typer.Option(..., help="Logical layer whose output becomes the injected boundary state."),
+    steps: int = typer.Option(8, min=1, help="Greedy continuation horizon."),
+    top_k: int = typer.Option(3, min=1, help="How many next-token candidates to retain per step."),
+    device: str = typer.Option("cpu", help="Torch device for the HF trace backend."),
+    dtype: str = typer.Option("auto", help="Torch dtype: auto, float32, float16, or bfloat16."),
+) -> None:
+    runner = HFTraceRunner(
+        model_name_or_path=model_name_or_path,
+        device=device,
+        dtype=dtype,
+    )
+    result = runner.compare_greedy_continuation_kv(
+        text=prompt,
+        boundary_layer=boundary_layer,
+        steps=steps,
+        top_k=top_k,
+    )
+
+    console.print(
+        "[bold]HF KV Generation Verification[/bold]\n"
+        "Compares a narrow KV-aware upper-stack continuation path against the frozen exact replay baseline."
+    )
+    console.print(f"Backend: {runner.backend}")
+    console.print(f"Model: {runner.model_name_or_path}")
+    console.print(f"Boundary layer: {result['boundary_layer']}")
+    console.print(f"Steps requested: {result['steps_requested']}")
+    console.print(f"Steps completed: {result['steps_completed']}")
+    console.print(f"Exact KV match: {'yes' if result['exact_match'] else 'no'}")
+    if result["first_divergence_step"] is not None:
+        console.print(f"First divergence step: {result['first_divergence_step']}")
+
+    metrics = Table(title="KV Path Summary")
+    metrics.add_column("Metric")
+    metrics.add_column("Value")
+    metrics.add_row("Baseline ms", f"{result['baseline_ms']:.2f}")
+    metrics.add_row("KV path ms", f"{result['kv_ms']:.2f}")
+    metrics.add_row("Cache bytes", str(result["cache_bytes"]))
+    console.print(metrics)
+
+    table = Table(title="Per-Step KV Agreement")
+    table.add_column("Step")
+    table.add_column("L2")
+    table.add_column("Cos")
+    table.add_column("Max Abs Diff")
+    table.add_column("Token Match")
+    table.add_column("Baseline Token")
+    table.add_column("KV Token")
+    for step in result["per_step"]:
+        table.add_row(
+            str(step["step"]),
+            f"{step['l2_error']:.8f}",
+            f"{step['cosine_similarity']:.8f}",
+            f"{step['max_abs_diff']:.8f}",
+            "yes" if step["token_match"] else "no",
+            f"{step['baseline_token_id']} {step['baseline_token_text']!r}",
+            f"{step['kv_token_id']} {step['kv_token_text']!r}",
+        )
+    console.print(table)
+
+
+@app.command("trace-generate-kv-diagnose")
+def trace_generate_kv_diagnose(
+    model_name_or_path: str = typer.Option(..., help="Transformers model id or local path."),
+    prompt: str = typer.Option(..., help="Prompt to trace and continue from."),
+    boundary_layer: int = typer.Option(..., help="Logical layer whose output becomes the injected boundary state."),
+    top_k: int = typer.Option(3, min=1, help="How many next-token candidates to display."),
+    device: str = typer.Option("cpu", help="Torch device for the HF trace backend."),
+    dtype: str = typer.Option("auto", help="Torch dtype: auto, float32, float16, or bfloat16."),
+) -> None:
+    runner = HFTraceRunner(
+        model_name_or_path=model_name_or_path,
+        device=device,
+        dtype=dtype,
+    )
+    result = runner.diagnose_kv_step_two(
+        text=prompt,
+        boundary_layer=boundary_layer,
+        top_k=top_k,
+    )
+
+    console.print(
+        "[bold]HF KV Step-2 Diagnosis[/bold]\n"
+        "Localizes the first layer where the KV-aware path diverges from the frozen exact baseline at the second resumed step."
+    )
+    console.print(f"Backend: {runner.backend}")
+    console.print(f"Model: {runner.model_name_or_path}")
+    console.print(f"Boundary layer: {result['boundary_layer']}")
+    console.print(f"Step-1 token: {result['step1_token_id']} {result['step1_token_text']!r}")
+    console.print(
+        "First divergent layer: "
+        + ("none" if result["first_divergent_layer"] is None else str(result["first_divergent_layer"]))
+    )
+
+    metrics = Table(title="Step-2 Logit Divergence")
+    metrics.add_column("Metric")
+    metrics.add_column("Value")
+    metrics.add_row("Cache bytes", str(result["cache_bytes"]))
+    metrics.add_row("Logit L2", f"{result['logit_l2_error']:.8f}")
+    metrics.add_row("Logit Cos", f"{result['logit_cosine_similarity']:.8f}")
+    metrics.add_row("Logit Max Abs Diff", f"{result['logit_max_abs_diff']:.8f}")
+    console.print(metrics)
+
+    layer_table = Table(title="Per-Layer Step-2 State Diff")
+    layer_table.add_column("Layer")
+    layer_table.add_column("Exact")
+    layer_table.add_column("L2")
+    layer_table.add_column("Cos")
+    layer_table.add_column("Max Abs Diff")
+    for row in result["per_layer"]:
+        layer_table.add_row(
+            str(row["layer"]),
+            "yes" if row["exact_match"] else "no",
+            f"{row['l2_error']:.8f}",
+            f"{row['cosine_similarity']:.8f}",
+            f"{row['max_abs_diff']:.8f}",
+        )
+    console.print(layer_table)
+
+
+@app.command("trace-generate-kv-three-path")
+def trace_generate_kv_three_path(
+    model_name_or_path: str = typer.Option(..., help="Transformers model id or local path."),
+    prompt: str = typer.Option(..., help="Prompt to trace and continue from."),
+    boundary_layer: int = typer.Option(..., help="Logical layer whose output becomes the injected boundary state."),
+    top_k: int = typer.Option(3, min=1, help="How many next-token candidates to display."),
+    device: str = typer.Option("cpu", help="Torch device for the HF trace backend."),
+    dtype: str = typer.Option("auto", help="Torch dtype: auto, float32, float16, or bfloat16."),
+) -> None:
+    runner = HFTraceRunner(
+        model_name_or_path=model_name_or_path,
+        device=device,
+        dtype=dtype,
+    )
+    result = runner.diagnose_kv_step_two_three_path(
+        text=prompt,
+        boundary_layer=boundary_layer,
+        top_k=top_k,
+    )
+
+    console.print(
+        "[bold]HF KV Three-Path Diagnosis[/bold]\n"
+        "Separates step-2 drift into exact resumed baseline (A), full-sequence recompute (B), and KV-aware path (C)."
+    )
+    console.print(f"Backend: {runner.backend}")
+    console.print(f"Model: {runner.model_name_or_path}")
+    console.print(f"Boundary layer: {result['boundary_layer']}")
+    console.print(f"Step-1 token: {result['step1_token_id']} {result['step1_token_text']!r}")
+    console.print(
+        "First A vs B divergent layer: "
+        + ("none" if result["first_recompute_divergent_layer"] is None else str(result["first_recompute_divergent_layer"]))
+    )
+    console.print(
+        "First A vs C divergent layer: "
+        + ("none" if result["first_kv_divergent_layer"] is None else str(result["first_kv_divergent_layer"]))
+    )
+
+    metrics = Table(title="Step-2 Logit Drift")
+    metrics.add_column("Path Pair")
+    metrics.add_column("L2")
+    metrics.add_column("Cos")
+    metrics.add_column("Max Abs Diff")
+    metrics.add_row("A vs B", f"{result['ab_logits']['l2_error']:.8f}", f"{result['ab_logits']['cosine_similarity']:.8f}", f"{result['ab_logits']['max_abs_diff']:.8f}")
+    metrics.add_row("A vs C", f"{result['ac_logits']['l2_error']:.8f}", f"{result['ac_logits']['cosine_similarity']:.8f}", f"{result['ac_logits']['max_abs_diff']:.8f}")
+    metrics.add_row("B vs C", f"{result['bc_logits']['l2_error']:.8f}", f"{result['bc_logits']['cosine_similarity']:.8f}", f"{result['bc_logits']['max_abs_diff']:.8f}")
+    console.print(metrics)
+
+    layer_table = Table(title="Per-Layer Step-2 Drift")
+    layer_table.add_column("Layer")
+    layer_table.add_column("A=B")
+    layer_table.add_column("A vs B L2")
+    layer_table.add_column("A=C")
+    layer_table.add_column("A vs C L2")
+    layer_table.add_column("B=C")
+    layer_table.add_column("B vs C L2")
+    for row in result["per_layer"]:
+        layer_table.add_row(
+            str(row["layer"]),
+            "yes" if row["ab_exact"] else "no",
+            f"{row['ab_l2']:.8f}",
+            "yes" if row["ac_exact"] else "no",
+            f"{row['ac_l2']:.8f}",
+            "yes" if row["bc_exact"] else "no",
+            f"{row['bc_l2']:.8f}",
+        )
+    console.print(layer_table)
 
 
 @app.command()
