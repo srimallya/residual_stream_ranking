@@ -8,120 +8,31 @@
   </head>
   <body>
     <div class="app-shell">
-      <aside class="rail rail-expanded" id="memory-rail">
-        <div class="rail-header">
-          <button class="rail-toggle" id="rail-toggle" aria-label="Toggle memory graph">
-            <span>⇠</span>
-          </button>
-          <div>
-            <p class="eyebrow">Shared Memory</p>
-            <h1>con-chat</h1>
-          </div>
-        </div>
-        <div class="rail-section">
-          <div class="rail-section-title">
-            <span>Conversation Graph</span>
-            <span class="meta" id="graph-count">7 nodes</span>
-          </div>
-          <svg id="memory-graph" viewBox="0 0 280 460" class="graph-canvas" aria-label="Conversation memory graph"></svg>
-        </div>
-        <div class="rail-section">
-          <div class="rail-section-title">
-            <span>Selected Memory</span>
-            <span class="meta" id="memory-kind">token@r/fp16</span>
-          </div>
-          <div class="memory-card">
-            <div class="memory-stat"><span>Tier</span><strong id="memory-tier">warm</strong></div>
-            <div class="memory-stat"><span>Turns</span><strong id="memory-turn-range">18-25</strong></div>
-            <div class="memory-stat"><span>Bytes</span><strong id="memory-bytes">1,536</strong></div>
-            <div class="memory-stat"><span>Last used</span><strong id="memory-last-used">just now</strong></div>
-          </div>
-        </div>
-      </aside>
+      <header class="app-header">
+        <h1>con-chat</h1>
+      </header>
 
-      <main class="chat-shell">
-        <header class="topbar">
-          <div>
-            <p class="eyebrow">Continuous Conversation</p>
-            <h2>Bounded live state, routed memory</h2>
-          </div>
-          <div class="status-cluster">
-            <div class="status-pill status-pill-preview" id="preview-pill" hidden>
-              <span class="dot dot-amber"></span>
-              <span>Browser preview</span>
-            </div>
-            <div class="status-pill">
-              <span class="dot dot-green"></span>
-              <span id="sidecar-status">Sidecar contract</span>
-            </div>
-            <div class="status-pill">
-              <span class="dot dot-blue"></span>
-              <span id="device-status">Gemma on mps, harness on cpu</span>
-            </div>
-          </div>
-        </header>
+      <main class="workspace">
+        <section class="chat-panel">
+          <div class="thread" id="thread"></div>
 
-        <section class="chat-layout">
-          <section class="thread-panel">
-            <div class="budget-bar">
-              <div class="budget-copy">
-                <span class="eyebrow">Active Window</span>
-                <strong id="token-budget-copy">21,184 / 32,768 tokens</strong>
-              </div>
-              <div class="budget-track">
-                <div class="budget-fill" id="budget-fill"></div>
-              </div>
-            </div>
-
-            <div class="thread" id="thread"></div>
-
-            <form class="composer" id="composer">
-              <textarea id="composer-input" rows="3" placeholder="Message con-chat..."></textarea>
-              <div class="composer-actions">
-                <p class="hint">This shell now runs a real local Python sidecar and persists turns, memory objects, and graph edges in SQLite.</p>
-                <button type="submit" class="send-button">Send</button>
-              </div>
-            </form>
-          </section>
-
-          <aside class="inspector-panel">
-            <section class="inspector-card">
-              <div class="inspector-title">Active Runtime</div>
-              <dl class="inspector-grid">
-                <div><dt>Model</dt><dd>Gemma 4 2B</dd></div>
-                <div><dt>Model device</dt><dd>mps</dd></div>
-                <div><dt>Orchestration</dt><dd>cpu</dd></div>
-                <div><dt>Memory object</dt><dd>token@r/fp16</dd></div>
-              </dl>
-            </section>
-            <section class="inspector-card">
-              <div class="inspector-title">Lifecycle</div>
-              <ul class="lifecycle-list">
-                <li><strong>Warm</strong><span>34</span></li>
-                <li><strong>Cold</strong><span>2</span></li>
-                <li><strong>Archived</strong><span>0</span></li>
-                <li><strong>Pinned</strong><span>4</span></li>
-              </ul>
-            </section>
-            <section class="inspector-card">
-              <div class="inspector-title">Latest Round Trip</div>
-              <dl class="inspector-grid inspector-grid-stack">
-                <div><dt>Total</dt><dd id="timing-total">n/a</dd></div>
-                <div><dt>Generation</dt><dd id="timing-generation">n/a</dd></div>
-                <div><dt>Prompt</dt><dd id="timing-prompt">n/a</dd></div>
-                <div><dt>Persist</dt><dd id="timing-persist">n/a</dd></div>
-              </dl>
-            </section>
-            <section class="inspector-card">
-              <div class="inspector-title">Next Product Slice</div>
-              <ul class="bullets">
-                <li>Assemble a bounded active window from persisted turns.</li>
-                <li>Seal older stable ranges into replay objects near 32k tokens.</li>
-                <li>Reinject recalled memory into live Gemma generation.</li>
-              </ul>
-            </section>
-          </aside>
+          <form class="composer" id="composer">
+            <textarea id="composer-input" rows="1" placeholder="Message con-chat..."></textarea>
+            <button type="submit" class="send-button">Send</button>
+          </form>
         </section>
+
+        <aside class="graph-rail">
+          <div class="graph-toolbar">
+            <span>Graph</span>
+            <div class="graph-controls">
+              <button type="button" class="graph-button" id="conversation-reset" aria-label="Reset conversation">Reset</button>
+            </div>
+          </div>
+          <div class="graph-stage" id="graph-stage">
+            <svg id="memory-graph" viewBox="0 0 320 720" class="graph-canvas" aria-label="Conversation memory graph"></svg>
+          </div>
+        </aside>
       </main>
     </div>
     <script src="./app.js"></script>

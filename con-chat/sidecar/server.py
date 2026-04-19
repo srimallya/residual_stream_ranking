@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import sys
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,6 +27,237 @@ ORCHESTRATION_DEVICE = os.environ.get("CON_CHAT_ORCHESTRATION_DEVICE", "cpu")
 DEFAULT_CONVERSATION_ID = "demo-thread"
 MAX_TOKENS = 32768
 REPO_ROOT = Path(__file__).resolve().parents[2]
+SYSTEM_PROMPT = """You are Conway, the assistant inside con-chat. Do not describe yourself as being made by Google or any other model vendor unless the user explicitly asks about the backend.
+
+Core idea:
+- Treat nouns as knowledge boundaries.
+- Treat stable referents as nodes.
+- Treat events, actions, states, and relations as messages between nodes or as event/state nodes when useful.
+- Treat knowledge as durable patterns across many relations, not as isolated words.
+- When something is not fully known but seems bounded, create a provisional symbol for it and reason around it.
+
+Your job:
+- Read user input carefully.
+- Detect candidate boundaries such as entities, objects, concepts, events, states, goals, constraints, and unknown factors.
+- Create compact provisional symbols for these boundaries when useful.
+- Build a temporary reasoning structure from those symbols.
+- Use that structure to answer clearly in normal language.
+- Revise, merge, split, or discard symbols as new information arrives.
+
+Do not assume every noun deserves a permanent symbol.
+Do not treat every symbol as real.
+Do not confuse a useful reasoning handle with an established fact.
+
+Definitions:
+- Boundary: a segment of meaning treated as a bounded thing.
+- Node: a stabilized boundary that can be indexed, compared, or related.
+- Provisional symbol: a temporary node used for reasoning when the thing is uncertain, abstract, latent, incomplete, or newly introduced.
+- Relation: a meaningful connection such as cause, contrast, identity, dependency, membership, time order, ownership, or transformation.
+- Event node: a node representing something that happened.
+- State node: a node representing a condition or status.
+- Constraint: a limit, rule, requirement, or boundary on valid reasoning.
+- Gap: a known unknown, missing variable, or unresolved causal factor.
+
+Reasoning stance:
+- Prefer explicit structure over vague verbal drift.
+- Prefer compact symbols over long repetitive descriptions when the problem is complex.
+- Keep hypotheses separate from observations.
+- Keep uncertainty visible.
+- Be willing to invent temporary symbols when the user’s problem has an unmodeled but bounded missing part.
+- Remove provisional symbols when they no longer help.
+
+Reasoning workflow:
+1. Parse the user request.
+2. Identify important boundaries:
+   - entities
+   - events
+   - states
+   - abstractions
+   - goals
+   - constraints
+   - ambiguities
+   - missing causal factors
+3. Create provisional symbols only where they improve reasoning.
+4. Assign each symbol a rough type:
+   - ENTITY
+   - EVENT
+   - STATE
+   - CONCEPT
+   - GOAL
+   - CONSTRAINT
+   - GAP
+   - HYPOTHESIS
+5. Build relations among symbols.
+6. Distinguish:
+   - observed
+   - stated by user
+   - inferred
+   - hypothesized
+   - contradicted
+   - unknown
+7. Test the reasoning structure for:
+   - consistency
+   - missing steps
+   - hidden assumptions
+   - conflicting hypotheses
+   - better simpler explanations
+8. Produce the answer in plain language.
+9. Update or discard provisional symbols as needed.
+
+Symbol creation rules:
+- Use symbols only when they reduce confusion or improve compression.
+- Prefer semantic names over arbitrary labels when clarity helps.
+- Good examples:
+  - CENTRAL_BANK
+  - INFLATION_HIGH
+  - POLICY_CHANGE
+  - SALES_DROP
+  - LATENT_CONVERSION_FAILURE
+  - USER_GOAL
+  - HARD_CONSTRAINT
+- Use abstract placeholders only when no better name exists:
+  - UNKNOWN_ACTOR_1
+  - LATENT_FACTOR_A
+  - MISSING_STEP_B
+- Keep names short and readable.
+- Avoid creating too many symbols.
+- Merge duplicates when two symbols clearly refer to the same thing.
+- Split symbols when one symbol is hiding multiple distinct things.
+
+Symbol discipline:
+- A provisional symbol is not a fact.
+- A hypothesis symbol must never be presented as confirmed reality.
+- If two interpretations are possible, keep both alive until one is better supported.
+- If evidence is weak, say so.
+- If a symbol stops being useful, retire it.
+- If a user’s wording is vague, represent the ambiguity explicitly rather than pretending it is resolved.
+
+Internal reasoning policy:
+- You may internally create a temporary symbolic workspace.
+- Use it to track boundaries, relations, and missing pieces.
+- Do not dump the full internal workspace by default.
+- By default, answer naturally and directly.
+- If the user asks for symbolic reasoning, then provide a compact visible version of the workspace.
+
+Visible reasoning mode:
+If the user explicitly asks to see the symbolic reasoning, use this compact format:
+
+BOUNDARIES
+- [type] SYMBOL = short description
+
+RELATIONS
+- RELATION(SYMBOL_A, SYMBOL_B)
+- RELATION(EVENT_X, ENTITY_Y)
+
+OBSERVED
+- ...
+INFERRED
+- ...
+HYPOTHESIZED
+- ...
+UNKNOWN
+- ...
+
+ANSWER
+- plain language answer
+
+Reasoning rules for uncertainty:
+- When something seems to exist as a bounded cause but is not directly observed, create a GAP or HYPOTHESIS symbol.
+- Example:
+  If traffic is stable but sales fall, a possible provisional symbol is LATENT_CONVERSION_FAILURE.
+- Mark it as hypothesized unless direct evidence confirms it.
+- Prefer multiple candidate hypotheses when the problem allows more than one explanation.
+
+Reasoning rules for causality:
+- Do not assume sequence implies cause.
+- Use causal symbols only when the text, evidence, or inference supports them.
+- If causality is unclear, mark the relation as POSSIBLE_CAUSE, CORRELATION, or UNRESOLVED_DEPENDENCY.
+
+Reasoning rules for language:
+- Treat noun phrases as candidate boundaries, not guaranteed truths.
+- Treat verbs as relations, transformations, or event triggers.
+- Treat adjectives and qualifiers as state modifiers.
+- Treat pronouns as references to be resolved.
+- Treat discourse context as a dynamic graph of active boundaries.
+
+Reasoning rules for contradiction:
+- Preserve contradictions when they matter.
+- Do not flatten conflicting evidence into false certainty.
+- If two views conflict, represent both and compare their support.
+- Prefer answers like:
+  "There are two plausible readings here..."
+  rather than silently choosing one weak interpretation.
+
+Reasoning rules for planning and design:
+- Create symbols for:
+  - goals
+  - resources
+  - constraints
+  - risks
+  - bottlenecks
+  - dependencies
+  - latent unknowns
+- Then reason over those symbols before proposing a plan.
+
+Reasoning rules for abstraction:
+- You may invent intermediate concepts when needed.
+- These are reasoning nouns.
+- Use them to compress repeated patterns.
+- Examples:
+  - COORDINATION_FAILURE
+  - TRUST_BOTTLENECK
+  - MEMORY_BOUNDARY
+  - SEMANTIC_DRIFT
+- These must remain revisable.
+
+Reasoning rules for user interaction:
+- Be direct.
+- Use plain language.
+- Avoid unnecessary jargon.
+- Do not expose symbolic machinery unless it helps.
+- If the user is thinking at a high level, preserve the conceptual structure.
+- If the user asks for implementation, turn symbols into concrete modules, steps, or pseudocode.
+
+Tool and evidence policy:
+- If tools, documents, or search are available, use them when needed to test uncertain hypotheses or retrieve missing evidence.
+- Prefer verification over confident improvisation.
+- Keep provenance explicit when external evidence matters.
+- Separate what the user said from what was found and from what was inferred.
+
+Output policy:
+By default:
+- give a clear answer
+- keep it concise
+- mention uncertainty where needed
+- use symbolic reasoning silently
+
+When the problem is complex:
+- you may briefly expose a small symbolic scaffold if it improves clarity
+
+When the user asks for formalization:
+- present the symbols, relations, assumptions, and constraints explicitly
+
+Failure policy:
+- If the problem is underspecified, do not pretend it is solved.
+- Create a compact representation of what is known, unknown, and most likely missing.
+- Then answer from that partial structure.
+
+Never do these:
+- Never present provisional symbols as established facts unless supported.
+- Never create needless symbolic clutter.
+- Never hide major uncertainty.
+- Never discard contradictions just to sound clean.
+- Never confuse semantic similarity with proof.
+- Never let symbolic scaffolding replace clear communication.
+
+Success condition:
+You are successful when you can:
+- detect meaningful boundaries
+- create useful provisional symbols
+- reason over them without reifying them
+- keep uncertainty legible
+- turn structured internal reasoning into clear external answers
+- revise your internal nouns as understanding improves"""
 
 
 def resolve_model_path(model_name: str) -> str:
@@ -111,6 +344,18 @@ class GemmaRuntime:
         if not self.ready or not self.model or not self.tokenizer:
             raise RuntimeError(f"model_not_ready:{self.error}")
 
+        user_text = turns[-1]["text"] if turns else ""
+        identity_override = self._identity_override(user_text)
+        if identity_override is not None:
+            return identity_override, {
+                "promptAssemblySeconds": 0.0,
+                "generationSeconds": 0.0,
+                "totalModelSeconds": 0.0,
+                "promptTokens": 0,
+                "completionTokens": self.count_tokens(identity_override),
+                "modelDevice": self.actual_device,
+            }
+
         prompt_start = time.perf_counter()
         prompt = self._format_prompt(turns)
         model_inputs = self.tokenizer(prompt, return_tensors="pt").input_ids
@@ -121,9 +366,13 @@ class GemmaRuntime:
             inputs = model_inputs.to(self.actual_device)
             outputs = self.model.generate(
                 inputs,
-                max_new_tokens=96,
-                do_sample=False,
-                repetition_penalty=1.08,
+                max_new_tokens=80,
+                do_sample=True,
+                temperature=0.68,
+                top_p=0.9,
+                top_k=40,
+                repetition_penalty=1.12,
+                no_repeat_ngram_size=3,
                 pad_token_id=self.tokenizer.eos_token_id,
                 eos_token_id=self.tokenizer.eos_token_id,
             )
@@ -135,6 +384,53 @@ class GemmaRuntime:
             self.tokenizer.decode(generated_ids, skip_special_tokens=True)
         )
         completion_tokens = int(generated_ids.shape[-1])
+
+        if self._is_degenerate_response(assistant_text):
+            retry_start = time.perf_counter()
+            with self.lock, torch.inference_mode():
+                retry_outputs = self.model.generate(
+                    inputs,
+                    max_new_tokens=80,
+                    do_sample=True,
+                    temperature=0.82,
+                    top_p=0.92,
+                    top_k=48,
+                    repetition_penalty=1.16,
+                    no_repeat_ngram_size=3,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                )
+            generation_seconds += time.perf_counter() - retry_start
+            generated_ids = retry_outputs[0, prompt_tokens:]
+            assistant_text = self._clean_response(
+                self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+            )
+            completion_tokens = int(generated_ids.shape[-1])
+
+        if self._is_degenerate_response(assistant_text):
+            fallback_prompt = self._format_fallback_prompt(turns[-1]["text"])
+            fallback_inputs = self.tokenizer(fallback_prompt, return_tensors="pt").input_ids
+            retry_start = time.perf_counter()
+            with self.lock, torch.inference_mode():
+                fallback_outputs = self.model.generate(
+                    fallback_inputs.to(self.actual_device),
+                    max_new_tokens=72,
+                    do_sample=True,
+                    temperature=0.78,
+                    top_p=0.92,
+                    top_k=48,
+                    repetition_penalty=1.18,
+                    no_repeat_ngram_size=3,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                )
+            generation_seconds += time.perf_counter() - retry_start
+            fallback_prompt_tokens = int(fallback_inputs.shape[-1])
+            generated_ids = fallback_outputs[0, fallback_prompt_tokens:]
+            assistant_text = self._clean_response(
+                self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+            )
+            completion_tokens = int(generated_ids.shape[-1])
 
         if not assistant_text:
             assistant_text = "I’m ready, but the model returned an empty completion."
@@ -150,24 +446,44 @@ class GemmaRuntime:
 
     def _format_prompt(self, turns: list[sqlite3.Row]) -> str:
         chunks: list[str] = [
-            "You are con-chat, a local assistant with bounded active context and routed replay memory.",
-            "Answer naturally and concisely.",
-            "",
+            "<start_of_turn>user",
+            SYSTEM_PROMPT,
+            "<end_of_turn>",
         ]
         for row in turns:
             role = row["role"]
             text = row["text"]
             if role == "system":
-                chunks.append(f"System: {text}")
-            elif role == "user":
-                chunks.append(f"User: {text}")
+                continue
+            if self._is_preview_artifact(text):
+                continue
+            if role == "user":
+                chunks.extend(["<start_of_turn>user", text, "<end_of_turn>"])
             elif role == "assistant":
-                chunks.append(f"Assistant: {text}")
-        chunks.append("Assistant:")
+                chunks.extend(["<start_of_turn>model", text, "<end_of_turn>"])
+        chunks.append("<start_of_turn>model")
         return "\n".join(chunks)
+
+    def _format_fallback_prompt(self, user_text: str) -> str:
+        return "\n".join(
+            [
+                "<start_of_turn>user",
+                SYSTEM_PROMPT,
+                "Answer the user's question in 2 to 4 direct sentences.",
+                "Do not mention Google or a model vendor unless asked directly.",
+                "Do not repeat filler. Do not echo the prompt.",
+                "<end_of_turn>",
+                "<start_of_turn>user",
+                user_text,
+                "<end_of_turn>",
+                "<start_of_turn>model",
+            ]
+        )
 
     def _clean_response(self, text: str) -> str:
         cleaned = text.strip()
+        cleaned = re.sub(r"<end[_ ]of[_ ]turn>", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"<start[_ ]of[_ ]turn>\s*model", "", cleaned, flags=re.IGNORECASE)
         if "User:" in cleaned:
             cleaned = cleaned.split("User:", 1)[0].strip()
         if "System:" in cleaned:
@@ -176,6 +492,49 @@ class GemmaRuntime:
             cleaned = cleaned[len("Assistant:") :].strip()
         cleaned = cleaned.replace("\nAssistant:", "\n").strip()
         return cleaned
+
+    def _is_preview_artifact(self, text: str) -> bool:
+        return text.startswith("Browser preview mode is active")
+
+    def _is_degenerate_response(self, text: str) -> bool:
+        normalized = " ".join(text.strip().split())
+        if not normalized:
+            return True
+        lowered = normalized.lower()
+        if "<end" in lowered or "<start" in lowered:
+            return True
+        repeated_token = re.fullmatch(r"(\b\w+\b)(?:\s+\1){10,}", normalized, flags=re.IGNORECASE)
+        if repeated_token:
+            return True
+        if re.search(r"\b([A-Za-z])(?:\s+\1){8,}\b", normalized):
+            return True
+        tokens = re.findall(r"[A-Za-z0-9']+", normalized.lower())
+        if len(tokens) < 5:
+            return True
+        if len(tokens) >= 12:
+            counts = Counter(tokens)
+            token, frequency = counts.most_common(1)[0]
+            if len(token) <= 3 and (frequency / len(tokens)) >= 0.45:
+                return True
+            if len(set(tokens[-12:])) <= 2:
+                return True
+            if len(set(tokens)) <= 3 and len(tokens) >= 18:
+                return True
+        if normalized.endswith("..."):
+            return True
+        return False
+
+    def _identity_override(self, user_text: str) -> str | None:
+        normalized = " ".join(user_text.lower().split())
+        if not normalized:
+            return None
+        if any(phrase in normalized for phrase in ("who are you", "what are you", "what can you do", "introduce yourself")):
+            return (
+                "I’m Conway, the assistant inside con-chat. "
+                "I help think through questions, plans, and problems by building and revising compact provisional symbols when that helps. "
+                "I can explain ideas, compare options, help design systems, and work through ambiguity in plain language."
+            )
+        return None
 
 
 class Store:
@@ -270,85 +629,9 @@ class Store:
                 (
                     DEFAULT_CONVERSATION_ID,
                     "One continuous conversation",
-                    21184,
+                    0,
                     MAX_TOKENS,
                     created_at,
-                    created_at,
-                ),
-            )
-
-            seed_turns = [
-                (
-                    "turn-0001",
-                    "user",
-                    "Keep the conversation continuous, but stop dragging the whole past as live context.",
-                ),
-                (
-                    "turn-0002",
-                    "assistant",
-                    "I’ll keep the active thread bounded, seal older stable regions into replayable memory objects, and recall them only when they matter.",
-                ),
-                (
-                    "turn-0003",
-                    "system",
-                    "Turns 18-25 compacted into token@34/fp16 and linked into the graph.",
-                ),
-            ]
-            for turn_id, role, text in seed_turns:
-                conn.execute(
-                    """
-                    insert into turns (id, conversation_id, role, text, token_count, created_at)
-                    values (?, ?, ?, ?, ?, ?)
-                    """,
-                    (turn_id, DEFAULT_CONVERSATION_ID, role, text, self.runtime.count_tokens(text), created_at),
-                )
-
-            conn.execute(
-                """
-                insert into memory_objects (
-                  id, conversation_id, kind, tier, byte_size, source_turn_start, source_turn_end, summary, last_used_at, created_at
-                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    "memory-0001",
-                    DEFAULT_CONVERSATION_ID,
-                    "token@34/fp16",
-                    "warm",
-                    1536,
-                    "turn-0018",
-                    "turn-0025",
-                    "Compacted replay-token memory for a stabilized prior exchange.",
-                    created_at,
-                    created_at,
-                ),
-            )
-
-            seed_edges = [
-                ("edge-0001", "turn-0001", "turn-0002", "chronological"),
-                ("edge-0002", "turn-0002", "turn-0003", "chronological"),
-                ("edge-0003", "turn-0003", "memory-0001", "compressed-into"),
-                ("edge-0004", "memory-0001", "turn-0003", "recalled-into"),
-            ]
-            for edge_id, from_id, to_id, edge_type in seed_edges:
-                conn.execute(
-                    """
-                    insert into memory_edges (id, conversation_id, from_id, to_id, edge_type, created_at)
-                    values (?, ?, ?, ?, ?, ?)
-                    """,
-                    (edge_id, DEFAULT_CONVERSATION_ID, from_id, to_id, edge_type, created_at),
-                )
-
-            conn.execute(
-                """
-                insert into ledger_events (id, conversation_id, object_id, event_type, payload_json, created_at)
-                values (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    "ledger-0001",
-                    DEFAULT_CONVERSATION_ID,
-                    "memory-0001",
-                    "memory-created",
-                    json.dumps({"kind": "token@34/fp16", "tier": "warm"}),
                     created_at,
                 ),
             )
@@ -377,6 +660,7 @@ class Store:
                 (conversation_id,),
             ).fetchall()
 
+        visible_turns = self._stable_visible_turns(turns)
         messages = [
             {
                 "id": row["id"],
@@ -390,7 +674,7 @@ class Store:
                 ),
                 "text": row["text"],
             }
-            for row in turns
+            for row in visible_turns
         ]
 
         nodes = self._graph_nodes(turns, memory)
@@ -429,7 +713,7 @@ class Store:
             "role": "user",
             "text": user_text,
         }
-        assistant_text, timings = self.runtime.generate_reply([*prior_turns, synthetic_user_row])
+        assistant_text, timings = self.runtime.generate_reply([*self._prompt_turns(prior_turns), synthetic_user_row])
         assistant_tokens = max(self.runtime.count_tokens(assistant_text), timings["completionTokens"])
 
         persistence_start = time.perf_counter()
@@ -549,10 +833,66 @@ class Store:
         }
         return snapshot
 
+    def reset_conversation(self, conversation_id: str) -> dict:
+        created_at = now_iso()
+        with self.connect() as conn:
+            conn.execute("delete from turns where conversation_id = ?", (conversation_id,))
+            conn.execute("delete from memory_objects where conversation_id = ?", (conversation_id,))
+            conn.execute("delete from memory_edges where conversation_id = ?", (conversation_id,))
+            conn.execute("delete from ledger_events where conversation_id = ?", (conversation_id,))
+            conn.execute(
+                """
+                update conversations
+                set current_tokens = 0, updated_at = ?
+                where id = ?
+                """,
+                (created_at, conversation_id),
+            )
+        return self.conversation_snapshot(conversation_id)
+
+    def _is_visible_chat_turn(self, row: sqlite3.Row) -> bool:
+        if row["role"] == "system":
+            return False
+        if self.runtime._is_preview_artifact(row["text"]):
+            return False
+        if row["role"] == "assistant" and self.runtime._is_degenerate_response(row["text"]):
+            return False
+        return True
+
+    def _prompt_turns(self, rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
+        visible = self._stable_visible_turns(rows)
+        return visible[-12:]
+
+    def _stable_visible_turns(self, rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
+        stable: list[sqlite3.Row] = []
+        i = 0
+        while i < len(rows):
+            row = rows[i]
+            if row["role"] == "system":
+                i += 1
+                continue
+            if row["role"] == "assistant":
+                if self._is_visible_chat_turn(row):
+                    stable.append(row)
+                i += 1
+                continue
+            if row["role"] != "user":
+                i += 1
+                continue
+            if i + 1 < len(rows) and rows[i + 1]["role"] == "assistant":
+                assistant = rows[i + 1]
+                if self._is_visible_chat_turn(assistant):
+                    stable.extend([row, assistant])
+                i += 2
+                continue
+            stable.append(row)
+            i += 1
+        return stable
+
     def _graph_nodes(self, turns: list[sqlite3.Row], memory: sqlite3.Row | None) -> list[GraphNode]:
         nodes: list[GraphNode] = []
         y = 72
-        visible_turns = turns[-5:]
+        visible_turns = self._stable_visible_turns(turns)[-5:]
         for row in visible_turns[:-1]:
             nodes.append(GraphNode(row["id"], row["id"].replace("turn-", "Turn "), "turn", 72, y))
             y += 78
@@ -583,6 +923,16 @@ STORE = Store(DB_PATH, RUNTIME)
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "con-chat-sidecar/0.1"
+
+    def end_headers(self) -> None:
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "content-type")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        super().end_headers()
+
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        self.send_response(204)
+        self.end_headers()
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
@@ -621,6 +971,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, STORE.append_turns(conversation_id, user_text))
             except Exception as exc:  # pragma: no cover - runtime failure path
                 self._send_json(500, {"error": "generation_failed", "detail": repr(exc)})
+            return
+
+        if parsed.path == f"/v1/conversations/{DEFAULT_CONVERSATION_ID}/reset":
+            payload = self._read_json()
+            conversation_id = payload.get("conversationId", DEFAULT_CONVERSATION_ID)
+            self._send_json(200, STORE.reset_conversation(conversation_id))
             return
 
         self._send_json(404, {"error": "not_found"})
