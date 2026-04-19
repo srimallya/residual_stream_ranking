@@ -22,6 +22,30 @@ app = typer.Typer(add_completion=False)
 console = Console()
 
 
+def expand_window_ids(
+    selected_ids: list[int],
+    *,
+    max_window_index: int,
+    exclude_ids: set[int],
+    neighbor_radius: int,
+) -> list[int]:
+    if neighbor_radius <= 0:
+        return selected_ids
+
+    expanded: list[int] = []
+    seen: set[int] = set()
+    for window_id in selected_ids:
+        for candidate in range(
+            max(0, window_id - neighbor_radius),
+            min(max_window_index, window_id + neighbor_radius) + 1,
+        ):
+            if candidate in exclude_ids or candidate in seen:
+                continue
+            expanded.append(candidate)
+            seen.add(candidate)
+    return expanded
+
+
 def select_checkpoints(
     mode: str,
     benchmark: BenchmarkCase,
@@ -30,6 +54,7 @@ def select_checkpoints(
     top_k: int,
     runner: GGUFRunner,
     rerank_strategy: str = "hybrid",
+    local_expansion_neighbors: int = 0,
 ) -> tuple[list[str], list[int]]:
     windows = split_windows(benchmark.document, lines_per_window=benchmark.window_lines)
     checkpoints = build_checkpoints(windows, runner.embed)
@@ -61,6 +86,26 @@ def select_checkpoints(
             recent_windows=recent_checkpoints,
             strategy=rerank_strategy,
         )
+        selected.extend(recent_checkpoints)
+    elif mode == "temporal_expanded":
+        query_embedding = runner.embed(query)
+        selected = rerank_checkpoints(
+            checkpoints,
+            query_embedding=query_embedding,
+            query_text=query,
+            top_k=top_k,
+            exclude_window_ids=recent_ids,
+            recent_windows=recent_checkpoints,
+            strategy=rerank_strategy,
+        )
+        selected_ids = [checkpoint.window.index for checkpoint in selected]
+        expanded_ids = expand_window_ids(
+            selected_ids,
+            max_window_index=len(windows) - 1,
+            exclude_ids=recent_ids,
+            neighbor_radius=local_expansion_neighbors,
+        )
+        selected = [checkpoint for checkpoint in checkpoints if checkpoint.window.index in expanded_ids]
         selected.extend(recent_checkpoints)
     else:
         raise ValueError(f"Unsupported mode: {mode}")
@@ -193,6 +238,35 @@ def collect_parse_failures(
     return failures
 
 
+def collect_staged_oracle_gaps(
+    per_case: list[dict[str, object]],
+    *,
+    staged_mode: str,
+    limit: int = 8,
+) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for entry in per_case:
+        staged = entry["results"].get(staged_mode)
+        oracle = entry["results"]["oracle"]
+        if staged is None:
+            continue
+        if staged["correct"] or not oracle["correct"]:
+            continue
+        rows.append(
+            {
+                "case_id": str(entry["case_id"]),
+                "distance": str(entry["distance_bin"]),
+                "mode": staged_mode,
+                "selected": ",".join(str(value) for value in staged["selected_ids"][:4]),
+                "prediction": str(staged["parsed"] or staged["prediction"]),
+                "oracle": str(oracle["parsed"] or oracle["prediction"]),
+            }
+        )
+        if len(rows) >= limit:
+            return rows
+    return rows
+
+
 def evaluate_case_modes(
     *,
     cases: list[ApolloCase],
@@ -200,6 +274,7 @@ def evaluate_case_modes(
     recent_windows: int,
     top_k: int,
     rerank_strategy: str = "hybrid",
+    local_expansion_neighbors: int = 0,
 ) -> tuple[list[dict[str, object]], dict[str, dict[str, dict[str, float]]]]:
     valid_answers = {case.answer.lower() for case in cases}
     per_case: list[dict[str, object]] = []
@@ -213,6 +288,7 @@ def evaluate_case_modes(
             top_k=top_k,
             runner=runner,
             rerank_strategy=rerank_strategy,
+            local_expansion_neighbors=local_expansion_neighbors,
         )
         recent_tokens = runner.token_count(recent_memory)
 
@@ -224,6 +300,7 @@ def evaluate_case_modes(
             top_k=top_k,
             runner=runner,
             rerank_strategy=rerank_strategy,
+            local_expansion_neighbors=local_expansion_neighbors,
         )
         oracle_memory = build_oracle_memory(
             benchmark=case,
@@ -276,7 +353,11 @@ def evaluate_case_modes(
             result["replay_tokens"] = max(0, result["memory_tokens"] - recent_tokens)
             mode_results[mode] = result
 
-        for mode in ["retrieval", "temporal"]:
+        active_modes = ["retrieval", "temporal"]
+        if local_expansion_neighbors > 0:
+            active_modes.append("temporal_expanded")
+
+        for mode in active_modes:
             memory, selected_ids = select_checkpoints(
                 mode=mode,
                 benchmark=case,
@@ -285,6 +366,7 @@ def evaluate_case_modes(
                 top_k=top_k,
                 runner=runner,
                 rerank_strategy=rerank_strategy,
+                local_expansion_neighbors=local_expansion_neighbors,
             )
             result = evaluate_response(
                 runner=runner,
@@ -298,7 +380,8 @@ def evaluate_case_modes(
             result["replay_tokens"] = max(0, result["memory_tokens"] - recent_tokens)
             mode_results[mode] = result
 
-        for mode in ["retrieval", "temporal"]:
+        ranking_orders["temporal_expanded"] = ranking_orders["temporal"]
+        for mode in active_modes:
             ranked_ids = ranking_orders[mode]
             mode_results[mode]["topk"] = {
                 f"top_{k}": case.target_window_index in ranked_ids[:k] for k in [1, 2, 4]
@@ -320,7 +403,10 @@ def evaluate_case_modes(
         )
 
     summary: dict[str, dict[str, dict[str, float]]] = {"overall": {}, "distance": {}}
-    modes = ["full", "recent", "retrieval", "temporal", "oracle"]
+    modes = ["full", "recent", "retrieval", "temporal"]
+    if local_expansion_neighbors > 0:
+        modes.append("temporal_expanded")
+    modes.append("oracle")
     valid_cases = [entry for entry in per_case if entry["valid"]]
     valid_count = len(valid_cases)
 
@@ -343,7 +429,10 @@ def evaluate_case_modes(
             "avg_replay_tokens": avg_replay,
         }
 
-    for breakdown_mode in ["retrieval", "temporal"]:
+    breakdown_modes = ["retrieval", "temporal"]
+    if local_expansion_neighbors > 0:
+        breakdown_modes.append("temporal_expanded")
+    for breakdown_mode in breakdown_modes:
         key = f"{breakdown_mode}_breakdown"
         if valid_count:
             mode_valid = [entry for entry in valid_cases]
@@ -627,6 +716,7 @@ def benchmark_apollo(
     seed: int = typer.Option(7, help="Deterministic benchmark seed."),
     n_ctx: int = typer.Option(4096, min=1024, help="Inference context size."),
     rerank_strategy: str = typer.Option("hybrid", help="Rerank strategy for temporal mode."),
+    local_expansion_neighbors: int = typer.Option(0, min=0, help="Neighbor radius for temporal expansion ablation."),
 ) -> None:
     runner = GGUFRunner(model_path=model_path, n_ctx=n_ctx)
     cases = build_apollo_cases(
@@ -643,6 +733,7 @@ def benchmark_apollo(
         recent_windows=recent_windows,
         top_k=top_k,
         rerank_strategy=rerank_strategy,
+        local_expansion_neighbors=local_expansion_neighbors,
     )
 
     valid_count = sum(1 for entry in per_case if entry["valid"])
@@ -662,7 +753,11 @@ def benchmark_apollo(
     table.add_column("Usage @ Hit")
     table.add_column("Avg Replay Tokens")
     table.add_column("Avg Latency ms")
-    for mode in ["full", "recent", "retrieval", "temporal", "oracle"]:
+    mode_order = ["full", "recent", "retrieval", "temporal"]
+    if local_expansion_neighbors > 0:
+        mode_order.append("temporal_expanded")
+    mode_order.append("oracle")
+    for mode in mode_order:
         stats = summary["overall"][mode]
         table.add_row(
             mode,
@@ -685,7 +780,11 @@ def benchmark_apollo(
     for distance_bin in ["near", "medium", "far"]:
         if distance_bin not in summary["distance"]:
             continue
-        for mode in ["recent", "retrieval", "temporal", "oracle"]:
+        distance_modes = ["recent", "retrieval", "temporal"]
+        if local_expansion_neighbors > 0:
+            distance_modes.append("temporal_expanded")
+        distance_modes.append("oracle")
+        for mode in distance_modes:
             stats = summary["distance"][distance_bin][mode]
             distance_table.add_row(
                 distance_bin,
@@ -709,9 +808,12 @@ def benchmark_apollo(
     breakdown_table.add_column("Metric")
     breakdown_table.add_column("Retrieval")
     breakdown_table.add_column("Temporal")
+    if local_expansion_neighbors > 0:
+        breakdown_table.add_column("Expanded")
     retrieval_breakdown = summary["overall"]["retrieval_breakdown"]
     temporal_breakdown = summary["overall"]["temporal_breakdown"]
-    for label, retrieval_value, temporal_value in [
+    expanded_breakdown = summary["overall"].get("temporal_expanded_breakdown")
+    breakdown_rows = [
         ("Top-1 recall", retrieval_breakdown["top1_recall"], temporal_breakdown["top1_recall"]),
         ("Top-2 recall", retrieval_breakdown["top2_recall"], temporal_breakdown["top2_recall"]),
         ("Top-4 recall", retrieval_breakdown["top4_recall"], temporal_breakdown["top4_recall"]),
@@ -733,8 +835,23 @@ def benchmark_apollo(
             retrieval_breakdown["right_parsed_wrong_rate"],
             temporal_breakdown["right_parsed_wrong_rate"],
         ),
-    ]:
-        breakdown_table.add_row(label, f"{retrieval_value:.2f}", f"{temporal_value:.2f}")
+    ]
+    for label, retrieval_value, temporal_value in breakdown_rows:
+        row = [label, f"{retrieval_value:.2f}", f"{temporal_value:.2f}"]
+        if expanded_breakdown is not None:
+            field_map = {
+                "Top-1 recall": "top1_recall",
+                "Top-2 recall": "top2_recall",
+                "Top-4 recall": "top4_recall",
+                "MRR": "mrr",
+                "Parse | hit": "parse_given_hit",
+                "Correct | hit & parse": "correct_given_hit_parse",
+                "Wrong window rate": "wrong_window_rate",
+                "Right window, unparsable": "right_unparsable_rate",
+                "Right window, parsed wrong": "right_parsed_wrong_rate",
+            }
+            row.append(f"{expanded_breakdown[field_map[label]]:.2f}")
+        breakdown_table.add_row(*row)
     console.print(breakdown_table)
 
     parse_failures = collect_parse_failures(per_case)
@@ -752,6 +869,27 @@ def benchmark_apollo(
                 failure["prediction"],
             )
         console.print(failures_table)
+
+    staged_mode = "temporal_expanded" if local_expansion_neighbors > 0 else "temporal"
+    oracle_gaps = collect_staged_oracle_gaps(per_case, staged_mode=staged_mode)
+    if oracle_gaps:
+        gaps_table = Table(title="Staged vs Oracle Gaps")
+        gaps_table.add_column("Case")
+        gaps_table.add_column("Distance")
+        gaps_table.add_column("Mode")
+        gaps_table.add_column("Selected")
+        gaps_table.add_column("Staged")
+        gaps_table.add_column("Oracle")
+        for row in oracle_gaps:
+            gaps_table.add_row(
+                row["case_id"],
+                row["distance"],
+                row["mode"],
+                row["selected"],
+                row["prediction"],
+                row["oracle"],
+            )
+        console.print(gaps_table)
 
 
 @app.command("sweep-apollo")
