@@ -1,0 +1,24 @@
+appId: com.srimallya.con-chat
+productName: con-chat
+directories:
+  output: dist
+files:
+  - app/**
+  - package.json
+  - sidecar/**
+  - docs/**
+extraResources:
+  - from: ../models/google--gemma-4-E2B-it
+    to: models/google--gemma-4-E2B-it
+  - from: ../artifacts
+    to: artifacts
+mac:
+  category: public.app-category.productivity
+  target:
+    - dmg
+dmg:
+  title: con-chat
+  iconSize: 96
+  window:
+    width: 640
+    height: 420

@@ -1,0 +1,367 @@
+:root {
+  color-scheme: dark;
+  --bg: #0b0f14;
+  --panel: #111722;
+  --panel-2: #182131;
+  --panel-3: #1f2a3d;
+  --line: rgba(198, 214, 236, 0.12);
+  --text: #edf3fb;
+  --muted: #9aa9bf;
+  --accent: #73d2de;
+  --accent-2: #f4b860;
+  --good: #70d48b;
+  --shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
+  --font-ui: "SF Pro Display", "Inter", system-ui, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  background:
+    radial-gradient(circle at top left, rgba(115, 210, 222, 0.12), transparent 28%),
+    radial-gradient(circle at top right, rgba(244, 184, 96, 0.1), transparent 24%),
+    var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
+}
+
+body {
+  min-height: 100vh;
+}
+
+.app-shell {
+  display: grid;
+  grid-template-columns: 340px 1fr;
+  min-height: 100vh;
+}
+
+.rail {
+  background: linear-gradient(180deg, rgba(17, 23, 34, 0.95), rgba(13, 18, 27, 0.98));
+  border-right: 1px solid var(--line);
+  padding: 24px 18px;
+  overflow: hidden;
+  transition: width 180ms ease, padding 180ms ease;
+}
+
+.rail.rail-collapsed {
+  width: 78px;
+  padding-inline: 12px;
+}
+
+.rail.rail-collapsed .rail-section,
+.rail.rail-collapsed h1,
+.rail.rail-collapsed .eyebrow {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.rail-header,
+.rail-section-title,
+.topbar,
+.composer-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.rail-toggle,
+.send-button {
+  border: 0;
+  border-radius: 14px;
+  cursor: pointer;
+}
+
+.rail-toggle {
+  width: 42px;
+  height: 42px;
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+.eyebrow {
+  margin: 0 0 6px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+h1,
+h2 {
+  margin: 0;
+  font-weight: 650;
+}
+
+h1 {
+  font-size: 22px;
+}
+
+h2 {
+  font-size: 28px;
+}
+
+.rail-section,
+.thread-panel,
+.inspector-card {
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--line);
+  border-radius: 24px;
+  box-shadow: var(--shadow);
+}
+
+.rail-section {
+  margin-top: 18px;
+  padding: 16px;
+}
+
+.meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.graph-canvas {
+  width: 100%;
+  height: 440px;
+  margin-top: 16px;
+  border-radius: 18px;
+  background: linear-gradient(180deg, rgba(24, 33, 49, 0.92), rgba(11, 15, 20, 0.8));
+}
+
+.memory-card,
+.inspector-grid,
+.lifecycle-list {
+  display: grid;
+  gap: 12px;
+}
+
+.memory-card {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: 16px;
+}
+
+.memory-stat,
+.inspector-grid div,
+.lifecycle-list li {
+  padding: 12px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.memory-stat span,
+.inspector-grid dt {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+.chat-shell {
+  padding: 28px;
+}
+
+.status-cluster {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+
+.dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+}
+
+.dot-green {
+  background: var(--good);
+}
+
+.dot-blue {
+  background: var(--accent);
+}
+
+.chat-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 18px;
+  margin-top: 20px;
+}
+
+.thread-panel {
+  padding: 20px;
+}
+
+.budget-bar {
+  margin-bottom: 18px;
+}
+
+.budget-copy {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.budget-track {
+  width: 100%;
+  height: 14px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  overflow: hidden;
+}
+
+.budget-fill {
+  height: 100%;
+  width: 64.6%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+}
+
+.thread {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-height: 520px;
+}
+
+.message {
+  max-width: 82%;
+  padding: 16px 18px;
+  border-radius: 22px;
+  line-height: 1.55;
+}
+
+.message.user {
+  align-self: flex-end;
+  background: linear-gradient(180deg, rgba(115, 210, 222, 0.22), rgba(115, 210, 222, 0.12));
+}
+
+.message.assistant {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.message.system {
+  max-width: 100%;
+  background: rgba(244, 184, 96, 0.12);
+  border: 1px solid rgba(244, 184, 96, 0.18);
+}
+
+.message-role {
+  margin-bottom: 8px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
+.composer {
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+}
+
+.composer textarea {
+  width: 100%;
+  resize: vertical;
+  min-height: 92px;
+  border-radius: 18px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text);
+  padding: 16px;
+  font: inherit;
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 0;
+  max-width: 70%;
+}
+
+.send-button {
+  padding: 12px 18px;
+  background: linear-gradient(135deg, var(--accent), #99e7da);
+  color: #032029;
+  font-weight: 700;
+}
+
+.inspector-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.inspector-card {
+  padding: 18px;
+}
+
+.inspector-title {
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  text-transform: uppercase;
+  margin-bottom: 14px;
+}
+
+.inspector-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.inspector-grid dd {
+  margin: 0;
+  font-weight: 700;
+}
+
+.lifecycle-list,
+.bullets {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.lifecycle-list li,
+.bullets li {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.bullets {
+  display: grid;
+  gap: 12px;
+}
+
+.bullets li {
+  justify-content: flex-start;
+  color: var(--text);
+  line-height: 1.45;
+}
+
+@media (max-width: 1280px) {
+  .app-shell {
+    grid-template-columns: 92px 1fr;
+  }
+
+  .chat-layout {
+    grid-template-columns: 1fr;
+  }
+}

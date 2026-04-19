@@ -1,0 +1,17 @@
+{
+  "name": "con-chat",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local macOS chat app with bounded active context, routed replay memory, and a bundled Gemma backend.",
+  "main": "app/main.js",
+  "scripts": {
+    "start": "electron .",
+    "lint:syntax": "node --check app/main.js && node --check app/preload.js && node --check app/renderer/app.js",
+    "package:dir": "electron-builder --dir",
+    "package:dmg": "electron-builder --mac dmg"
+  },
+  "devDependencies": {
+    "electron": "^30.0.9",
+    "electron-builder": "^24.13.3"
+  }
+}

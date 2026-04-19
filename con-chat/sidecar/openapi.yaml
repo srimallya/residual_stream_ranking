@@ -1,0 +1,194 @@
+openapi: 3.1.0
+info:
+  title: con-chat sidecar
+  version: 0.1.0
+  description: Local inference sidecar contract for Gemma chat, replay memory, and lifecycle reporting.
+servers:
+  - url: http://127.0.0.1:4318
+paths:
+  /v1/health:
+    get:
+      summary: Sidecar health probe
+      responses:
+        "200":
+          description: Healthy
+  /v1/chat/respond:
+    post:
+      summary: Generate the next assistant turn from bounded active state plus recalled memory.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatRequest"
+      responses:
+        "200":
+          description: Chat response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatResponse"
+  /v1/conversations/{conversationId}/graph:
+    get:
+      summary: Return the persisted conversation graph, selected memory object, and visible turns for the chat shell.
+      parameters:
+        - in: path
+          name: conversationId
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Conversation graph snapshot
+  /v1/memory/compact:
+    post:
+      summary: Seal an older conversation region into a replayable memory object.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CompactRequest"
+      responses:
+        "200":
+          description: Compaction result
+  /v1/memory/retrieve:
+    post:
+      summary: Retrieve memory objects for the current turn using staged routing.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RetrieveRequest"
+      responses:
+        "200":
+          description: Retrieval result
+  /v1/memory/ledger/report:
+    get:
+      summary: Return current memory ledger tiers and suggestions.
+      responses:
+        "200":
+          description: Ledger report
+components:
+  schemas:
+    ChatRequest:
+      type: object
+      required:
+        - conversationId
+        - userText
+        - activeWindow
+      properties:
+        conversationId:
+          type: string
+        userText:
+          type: string
+        activeWindow:
+          $ref: "#/components/schemas/ActiveWindow"
+        recalledObjects:
+          type: array
+          items:
+            $ref: "#/components/schemas/MemoryObjectRef"
+    ChatResponse:
+      type: object
+      required:
+        - assistantText
+        - conversation
+        - graph
+        - messages
+      properties:
+        assistantText:
+          type: string
+        conversation:
+          type: object
+        graph:
+          type: object
+        messages:
+          type: array
+          items:
+            type: object
+        selectedMemory:
+          type: object
+    CompactRequest:
+      type: object
+      required:
+        - conversationId
+        - turnRange
+        - replayKind
+      properties:
+        conversationId:
+          type: string
+        turnRange:
+          type: object
+          required: [startTurnId, endTurnId]
+          properties:
+            startTurnId:
+              type: string
+            endTurnId:
+              type: string
+        replayKind:
+          type: string
+          enum: [token-fp16, token-exact, band-full, text-fallback]
+    RetrieveRequest:
+      type: object
+      required:
+        - conversationId
+        - queryText
+      properties:
+        conversationId:
+          type: string
+        queryText:
+          type: string
+        retrievalBudget:
+          type: integer
+          default: 4
+    ActiveWindow:
+      type: object
+      required:
+        - maxTokens
+        - currentTokens
+      properties:
+        maxTokens:
+          type: integer
+          example: 32768
+        currentTokens:
+          type: integer
+        activeTurnIds:
+          type: array
+          items:
+            type: string
+    MemoryObjectRef:
+      type: object
+      required:
+        - id
+        - kind
+      properties:
+        id:
+          type: string
+        kind:
+          type: string
+        tier:
+          type: string
+          enum: [pinned, warm, cold, archived]
+    TokenUsage:
+      type: object
+      properties:
+        promptTokens:
+          type: integer
+        completionTokens:
+          type: integer
+        activeWindowTokens:
+          type: integer
+    GraphEvent:
+      type: object
+      required:
+        - type
+        - nodeId
+      properties:
+        type:
+          type: string
+          enum: [turn-added, memory-created, memory-recalled, edge-added]
+        nodeId:
+          type: string
+        relatedId:
+          type: string
