@@ -815,3 +815,16 @@ Horizon extension:
   - `depth 3` is no longer plausibly safe in general
   - `depth 2` remains continuation-unsafe everywhere
   - code-like prompts still allow token agreement to survive longer than ranking stability
+
+Replay-layer probe:
+
+- the next mechanism probe held the same fixed prompt-family panel and `20`-step horizon while shifting replay layer:
+  - replay layer `9`
+  - replay layer `11`
+- result:
+  - replay layer `9`: the full local band `7,8,9` is continuation-safe across the tested panel
+  - replay layer `10`: the full local band `7,8,9,10` remains continuation-safe across the tested panel
+  - replay layer `11`: even the full local band `7,8,9,10,11` is not continuation-safe across the tested panel
+- this sharpens the mechanism claim:
+  - compact stability depends on replay-layer location, not just delta-band width
+  - the safe-object story is local to particular replay cuts rather than universally "keep the whole late band"

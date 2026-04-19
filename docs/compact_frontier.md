@@ -120,6 +120,98 @@ On the current GPT-2 compact frontier, the only continuation-safe reduced replay
 - replay layer `10`
 - full local late band `7,8,9,10`
 
+## Nearby Replay-Layer Probe
+
+The next mechanism question was whether the same fixed prompt-family panel and the same `20`-step horizon would preserve the "full local band is safe" story when the replay layer shifts slightly.
+
+Tested replay layers:
+
+- `9`
+- `11`
+
+Boundary layer remained fixed at `6`.
+
+### Replay Layer 9
+
+Depths tested:
+
+- `0` through `3`
+- full local band at this cut is `depth 3` = deltas `7,8,9`
+
+Observed result:
+
+- the full local band (`7,8,9`) is continuation-safe across the entire fixed prompt-family panel:
+  - token agreement: `1.00`
+  - top-5 full-overlap steps: `20/20`
+  - first divergence: none
+- thinner objects remain unsafe and prompt-family-dependent
+
+Representative table:
+
+| Object Kept | Prompt Family | Token Agreement / 20 | First Divergence Step | Top-5 Full-Overlap Steps | Current Read |
+| --- | --- | ---: | ---: | ---: | --- |
+| `depth 0` | factual-simple | `0.20` | `4` | `0/20` | Too thin |
+| `depth 2` (`8,9`) | factual-simple | `0.20` | `4` | `3/20` | Unsafe |
+| `depth 3` (`7,8,9`) | factual-simple | `1.00` | none | `20/20` | Safe |
+| `depth 0` | factual-compositional | `0.25` | `6` | `1/20` | Too thin |
+| `depth 2` (`8,9`) | factual-compositional | `0.35` | `6` | `1/20` | Unsafe |
+| `depth 3` (`7,8,9`) | factual-compositional | `1.00` | none | `20/20` | Safe |
+| `depth 0` | narrative | `0.00` | `1` | `0/20` | Too thin |
+| `depth 2` (`8,9`) | narrative | `0.35` | `6` | `5/20` | Unsafe |
+| `depth 3` (`7,8,9`) | narrative | `1.00` | none | `20/20` | Safe |
+| `depth 0` | procedural / instruction-like | `0.00` | `1` | `0/20` | Too thin |
+| `depth 2` (`8,9`) | procedural / instruction-like | `0.40` | `9` | `4/20` | Unsafe |
+| `depth 3` (`7,8,9`) | procedural / instruction-like | `1.00` | none | `20/20` | Safe |
+| `depth 0` | code-like completion | `0.25` | `6` | `0/20` | Too thin |
+| `depth 2` (`8,9`) | code-like completion | `1.00` | none | `11/20` | Tokens stable, ranking not stable |
+| `depth 3` (`7,8,9`) | code-like completion | `1.00` | none | `20/20` | Safe |
+
+### Replay Layer 11
+
+Depths tested:
+
+- `0` through `5`
+- full local band at this cut is `depth 5` = deltas `7,8,9,10,11`
+
+Observed result:
+
+- no tested compact object at replay layer `11` was continuation-safe on the fixed prompt-family panel
+- even the full local band (`7,8,9,10,11`) failed early across every prompt family
+- top-5 full-overlap steps stayed at `0/20` for the full local band on the tested panel
+
+Representative result for the full local band:
+
+| Prompt Family | Token Agreement / 20 | First Divergence Step | Top-5 Full-Overlap Steps | Current Read |
+| --- | ---: | ---: | ---: | --- |
+| factual-simple | `0.15` | `2` | `0/20` | Not safe |
+| factual-compositional | `0.05` | `1` | `0/20` | Not safe |
+| narrative | `0.10` | `1` | `0/20` | Not safe |
+| procedural / instruction-like | `0.00` | `1` | `0/20` | Not safe |
+| code-like completion | `0.05` | `2` | `0/20` | Not safe |
+
+### What The Replay-Layer Probe Means
+
+- replay-layer locality matters, not just delta depth
+- the current "safe full local band" story holds at replay layers `9` and `10`
+- that story does **not** hold at replay layer `11`
+- therefore, the compact replay frontier depends on where the replay object re-enters the stack, not just how much late-band information it keeps
+
+## Current Mechanism Read
+
+On the tested GPT-2 compact frontier:
+
+- replay layer `9`:
+  - full local band `7,8,9` is continuation-safe
+- replay layer `10`:
+  - full local band `7,8,9,10` is continuation-safe
+- replay layer `11`:
+  - even the full local band `7,8,9,10,11` is not continuation-safe
+
+So the current safe-object story is more specific than "keep the full late band":
+
+- a full local late band is sufficient at some replay layers
+- but not at all replay layers
+
 ## Next Widening
 
 - keep this table as the main artifact for the compact branch
