@@ -205,6 +205,27 @@ Useful flags:
 - `--rerank-strategy`: retrieval strategy for temporal mode, including `staged`
 - `--local-expansion-neighbors`: neighbor radius for the `temporal_expanded` ablation
 
+Verify offline hidden-state reconstruction with a Hugging Face backend:
+
+```bash
+.venv/bin/residual-lab trace-verify \
+  --model-name-or-path gpt2 \
+  --prompt "The capital of France is" \
+  --layer-cutoff-b 6 \
+  --delta-layers 7,8,9,10,11
+```
+
+Verify phase 2A resumed execution for GPT-2-class decoder models:
+
+```bash
+.venv/bin/residual-lab trace-resume-verify \
+  --model-name-or-path gpt2 \
+  --prompt "The capital of France is" \
+  --boundary-layer 6
+```
+
+`trace-verify` captures observed layer outputs for one token, stores the boundary state plus incremental deltas, and checks offline reconstruction. `trace-resume-verify` takes the next narrow step: inject a captured full-sequence boundary hidden state at one layer, run the remaining layers, and compare resumed logits against the direct pass for one target token.
+
 ## Interpreting Results
 
 Expected behavior for the current prototype:
@@ -228,7 +249,8 @@ The current benchmark evidence supports this decomposition:
 - checkpoint replay is a text-memory proxy, not exact residual-state replay
 - the Apollo benchmark is still a constructed harness, not a production task suite
 - quality depends heavily on the selected model and embedding behavior
-- the current backend cannot populate the trace payload with true residual tensors
+- true hidden-state injection is currently implemented only for a narrow GPT-2-class phase 2A verification path
+- next-token continuation after injected-state resume is not implemented yet
 - the bundled GGUF models are local dependencies and are not intended to be committed to git
 
 ## Roadmap
@@ -238,8 +260,9 @@ Likely next steps from the current state:
 1. Improve replay packet quality on the staged-hit-but-wrong slice.
 2. Test larger local neighborhoods and packet enrichment against the medium-distance bucket.
 3. Run context-budget ablations such as `4096` vs `8192`.
-4. Swap to a backend that exposes layerwise residual or hidden-state traces.
-5. Populate the trace payload with exact residual-state checkpoint objects and evaluate reconstruction fidelity.
+4. Broaden the HF trace backend beyond the current verification path and harden resumed-forward agreement checks.
+5. Add next-token continuation after resumed execution.
+6. Compare semantic replay, offline trace reconstruction, and resumed execution on the same cases.
 
 ## License
 

@@ -638,6 +638,46 @@ def trace_verify(
     console.print(table)
 
 
+@app.command("trace-resume-verify")
+def trace_resume_verify(
+    model_name_or_path: str = typer.Option(..., help="Transformers model id or local path."),
+    prompt: str = typer.Option(..., help="Prompt to trace and resume."),
+    boundary_layer: int = typer.Option(..., help="Logical layer whose output becomes the injected boundary state."),
+    target_token_index: int = typer.Option(-1, help="Token index to compare logits for. Defaults to the last token."),
+    device: str = typer.Option("cpu", help="Torch device for the HF trace backend."),
+    dtype: str = typer.Option("auto", help="Torch dtype: auto, float32, float16, or bfloat16."),
+) -> None:
+    runner = HFTraceRunner(
+        model_name_or_path=model_name_or_path,
+        device=device,
+        dtype=dtype,
+    )
+    comparison = runner.compare_resumed_logits(
+        text=prompt,
+        boundary_layer=boundary_layer,
+        target_token_index=target_token_index,
+    )
+
+    console.print(
+        "[bold]HF Resume Verification[/bold]\n"
+        "Phase 2A check: inject a captured full-sequence boundary hidden state and resume the remaining layers."
+    )
+    console.print(f"Backend: {runner.backend}")
+    console.print(f"Model: {runner.model_name_or_path}")
+    console.print(f"Boundary layer: {comparison['boundary_layer']}")
+    console.print(f"Start layer: {comparison['start_layer']}")
+    console.print(f"Target token index: {comparison['target_token_index']}")
+
+    table = Table(title="Resumed Logit Agreement")
+    table.add_column("Metric")
+    table.add_column("Value")
+    table.add_row("L2 error", f"{comparison['l2_error']:.8f}")
+    table.add_row("Cosine similarity", f"{comparison['cosine_similarity']:.8f}")
+    table.add_row("Max abs diff", f"{comparison['max_abs_diff']:.8f}")
+    table.add_row("Vocab size", str(comparison["vocab_size"]))
+    console.print(table)
+
+
 @app.command()
 def benchmark(
     model_path: str = typer.Option(..., help="Path to the GGUF model."),
