@@ -907,7 +907,7 @@ def trace_compact_sweep(
     )
 
     table = Table(title="Compact Replay Variants")
-    table.add_column("Delta Depth")
+    table.add_column("Object")
     table.add_column("Kept Layers")
     table.add_column("Bytes")
     table.add_column("Token Match")
@@ -918,7 +918,7 @@ def trace_compact_sweep(
     for row in result["rows"]:
         kept_layers = ",".join(str(layer) for layer in row["kept_layers"]) or "-"
         table.add_row(
-            str(row["delta_depth"]),
+            str(row["object_label"]),
             kept_layers,
             str(row["compact_bytes"]),
             "yes" if row["token_match"] else "no",
@@ -981,7 +981,7 @@ def trace_compact_operational(
     console.print(f"Steps requested: {result['steps_requested']}")
 
     table = Table(title="Compact Continuation Envelope")
-    table.add_column("Depth")
+    table.add_column("Object")
     table.add_column("Kept Layers")
     table.add_column("Token Agreement")
     table.add_column(f"Top-{top_k}")
@@ -991,7 +991,7 @@ def trace_compact_operational(
     for row in result["rows"]:
         kept_layers = ",".join(str(layer) for layer in row["kept_layers"]) or "-"
         table.add_row(
-            str(row["delta_depth"]),
+            str(row["object_label"]),
             kept_layers,
             f"{row['token_agreement']:.2f}",
             f"{row['topk_full_steps']}/{row['steps_completed']}",

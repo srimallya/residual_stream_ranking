@@ -141,6 +141,9 @@ class HFTraceRunner:
         return self._trace_inputs(encoded["input_ids"], encoded["attention_mask"])
 
     def _trace_inputs(self, input_ids: object, attention_mask: object) -> HFTraceSession:
+        if hasattr(self.model, "transformer") and hasattr(self.model.transformer, "h"):
+            return self._trace_gpt2_inputs(input_ids=input_ids, attention_mask=attention_mask)
+
         with self._torch.no_grad():
             output = self.model(
                 input_ids=input_ids,
@@ -158,6 +161,36 @@ class HFTraceRunner:
             logical_layer = index - 1
             values = hidden_state[0].detach().cpu().to(self._torch.float32).numpy()
             layer_states[logical_layer] = values
+        return HFTraceSession(
+            input_ids=input_ids_list,
+            tokens=tokens,
+            attention_mask=attention_mask_list,
+            layer_states=layer_states,
+        )
+
+    def _trace_gpt2_inputs(self, *, input_ids: object, attention_mask: object) -> HFTraceSession:
+        transformer = self._require_gpt2_model()
+        with self._torch.no_grad():
+            hidden_states, causal_attention_mask, position_ids = self._prepare_gpt2_hidden_inputs(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
+            layer_states: dict[int, np.ndarray] = {
+                -1: hidden_states[0].detach().cpu().to(self._torch.float32).numpy()
+            }
+            for layer_index, block in enumerate(transformer.h):
+                block_output = block(
+                    hidden_states,
+                    attention_mask=causal_attention_mask,
+                    use_cache=False,
+                    position_ids=position_ids,
+                )
+                hidden_states = block_output[0] if isinstance(block_output, tuple) else block_output
+                layer_states[layer_index] = hidden_states[0].detach().cpu().to(self._torch.float32).numpy()
+
+        input_ids_list = input_ids[0].detach().cpu().tolist()
+        attention_mask_list = attention_mask[0].detach().cpu().tolist()
+        tokens = self.tokenizer.convert_ids_to_tokens(input_ids_list)
         return HFTraceSession(
             input_ids=input_ids_list,
             tokens=tokens,
@@ -431,6 +464,23 @@ class HFTraceRunner:
             results.append((int(token_id), token_text, float(logits[token_id])))
         return results
 
+    def _fp16_replay_token_surrogate(self, token_state: np.ndarray) -> tuple[np.ndarray, int]:
+        fp16 = np.asarray(token_state, dtype=np.float16)
+        restored = fp16.astype(np.float32)
+        return restored, int(fp16.nbytes)
+
+    def _int8_replay_token_surrogate(self, token_state: np.ndarray) -> tuple[np.ndarray, int]:
+        values = np.asarray(token_state, dtype=np.float32)
+        max_abs = float(np.max(np.abs(values)))
+        if max_abs == 0.0:
+            scale = np.float32(1.0)
+            quantized = np.zeros_like(values, dtype=np.int8)
+        else:
+            scale = np.float32(max_abs / 127.0)
+            quantized = np.clip(np.rint(values / scale), -127, 127).astype(np.int8)
+        restored = quantized.astype(np.float32) * scale
+        return restored, int(quantized.nbytes + np.dtype(np.float32).itemsize)
+
     def compare_next_token(
         self,
         *,
@@ -511,6 +561,7 @@ class HFTraceRunner:
         )
         exact_token_id = int(np.argmax(exact_logits))
         exact_top_k = self._top_k_tokens(exact_logits, top_k=top_k)
+        direct_replay_token = np.asarray(exact_replay_hidden[resolved_token_index], dtype=np.float32).copy()
 
         token_boundary_state = np.asarray(session.layer_states[boundary_layer][resolved_token_index], dtype=np.float32).copy()
         full_delta_layers = list(range(boundary_layer + 1, replay_layer + 1))
@@ -523,6 +574,76 @@ class HFTraceRunner:
         }
 
         rows: list[dict[str, object]] = []
+        rows.append(
+            {
+                "object_kind": "replay_token",
+                "object_label": f"token@{replay_layer}",
+                "delta_depth": None,
+                "kept_layers": [replay_layer],
+                "compact_bytes": int(direct_replay_token.nbytes),
+                "full_replay_token_bytes": int(direct_replay_token.nbytes),
+                "full_trace_bytes": int(
+                    token_boundary_state.nbytes + sum(delta.nbytes for delta in token_deltas.values())
+                ),
+                "l2_error": 0.0,
+                "cosine_similarity": 1.0,
+                "max_abs_diff": 0.0,
+                "exact_token_id": exact_token_id,
+                "exact_token_text": self.tokenizer.decode([exact_token_id]),
+                "compact_token_id": exact_token_id,
+                "compact_token_text": self.tokenizer.decode([exact_token_id]),
+                "token_match": True,
+                "topk_overlap": top_k,
+                "topk_size": top_k,
+                "exact_top_k": exact_top_k,
+                "compact_top_k": exact_top_k,
+            }
+        )
+        for surrogate_kind, surrogate_label, surrogate_fn in (
+            ("replay_token_fp16", f"token@{replay_layer}/fp16", self._fp16_replay_token_surrogate),
+            ("replay_token_int8", f"token@{replay_layer}/int8", self._int8_replay_token_surrogate),
+        ):
+            surrogate_token, surrogate_bytes = surrogate_fn(direct_replay_token)
+            surrogate_hidden = exact_replay_hidden.copy()
+            surrogate_hidden[resolved_token_index] = surrogate_token
+            surrogate_logits = self.predict_from_hidden(
+                hidden_state=surrogate_hidden,
+                start_layer=replay_layer + 1,
+                attention_mask=attention_mask_list,
+                target_token_index=-1,
+            )
+            surrogate_delta = surrogate_logits - exact_logits
+            surrogate_token_id = int(np.argmax(surrogate_logits))
+            surrogate_top_k = self._top_k_tokens(surrogate_logits, top_k=top_k)
+            exact_top_ids = {row[0] for row in exact_top_k}
+            surrogate_top_ids = {row[0] for row in surrogate_top_k}
+            rows.append(
+                {
+                    "object_kind": surrogate_kind,
+                    "object_label": surrogate_label,
+                    "delta_depth": None,
+                    "kept_layers": [replay_layer],
+                    "compact_bytes": surrogate_bytes,
+                    "full_replay_token_bytes": int(direct_replay_token.nbytes),
+                    "full_trace_bytes": int(
+                        token_boundary_state.nbytes + sum(delta.nbytes for delta in token_deltas.values())
+                    ),
+                    "l2_error": float(np.linalg.norm(surrogate_delta)),
+                    "cosine_similarity": float(
+                        np.dot(surrogate_logits, exact_logits) / (np.linalg.norm(surrogate_logits) * np.linalg.norm(exact_logits))
+                    ) if np.linalg.norm(surrogate_logits) and np.linalg.norm(exact_logits) else 0.0,
+                    "max_abs_diff": float(np.max(np.abs(surrogate_delta))),
+                    "exact_token_id": exact_token_id,
+                    "exact_token_text": self.tokenizer.decode([exact_token_id]),
+                    "compact_token_id": surrogate_token_id,
+                    "compact_token_text": self.tokenizer.decode([surrogate_token_id]),
+                    "token_match": surrogate_token_id == exact_token_id,
+                    "topk_overlap": len(exact_top_ids & surrogate_top_ids),
+                    "topk_size": top_k,
+                    "exact_top_k": exact_top_k,
+                    "compact_top_k": surrogate_top_k,
+                }
+            )
         seen_depths: set[int] = set()
         for raw_depth in delta_depths:
             depth = int(raw_depth)
@@ -556,6 +677,8 @@ class HFTraceRunner:
 
             rows.append(
                 {
+                    "object_kind": "delta_band",
+                    "object_label": f"delta_depth={capped_depth}",
                     "delta_depth": capped_depth,
                     "kept_layers": kept_layers,
                     "compact_bytes": compact_bytes,
@@ -580,7 +703,7 @@ class HFTraceRunner:
                 }
             )
 
-        rows.sort(key=lambda row: row["delta_depth"])
+        rows.sort(key=lambda row: (-1 if row["delta_depth"] is None else row["delta_depth"]))
         return {
             "boundary_layer": boundary_layer,
             "replay_layer": replay_layer,
@@ -641,6 +764,33 @@ class HFTraceRunner:
 
         replay_hidden = np.asarray(session.layer_states[replay_layer], dtype=np.float32).copy()
         replay_hidden[resolved_token_index] = reconstructed_token
+        return self.predict_from_hidden(
+            hidden_state=replay_hidden,
+            start_layer=replay_layer + 1,
+            attention_mask=session.attention_mask,
+            target_token_index=-1,
+        )
+
+    def _surrogate_replay_token_next_token_logits_from_inputs(
+        self,
+        *,
+        input_ids: object,
+        attention_mask: object,
+        replay_layer: int,
+        surrogate_kind: str,
+        token_index: int = -1,
+    ) -> np.ndarray:
+        session = self._trace_inputs(input_ids, attention_mask)
+        resolved_token_index = token_index if token_index >= 0 else session.token_count + token_index
+        replay_hidden = np.asarray(session.layer_states[replay_layer], dtype=np.float32).copy()
+        token_state = np.asarray(replay_hidden[resolved_token_index], dtype=np.float32).copy()
+        if surrogate_kind == "replay_token_fp16":
+            restored, _ = self._fp16_replay_token_surrogate(token_state)
+        elif surrogate_kind == "replay_token_int8":
+            restored, _ = self._int8_replay_token_surrogate(token_state)
+        else:
+            raise ValueError(f"Unsupported replay-token surrogate kind: {surrogate_kind}")
+        replay_hidden[resolved_token_index] = restored
         return self.predict_from_hidden(
             hidden_state=replay_hidden,
             start_layer=replay_layer + 1,
@@ -736,6 +886,8 @@ class HFTraceRunner:
             full_topk_steps = sum(1 for row in per_step if row["topk_overlap"] == row["topk_size"])
             rows.append(
                 {
+                    "object_kind": "delta_band",
+                    "object_label": f"delta_depth={depth}",
                     "delta_depth": depth,
                     "kept_layers": list(range(replay_layer - depth + 1, replay_layer + 1)) if depth > 0 else [],
                     "token_agreement": token_matches / len(per_step) if per_step else 0.0,
@@ -750,7 +902,91 @@ class HFTraceRunner:
                 }
             )
 
-        rows.sort(key=lambda row: row["delta_depth"])
+        for surrogate_kind, surrogate_label in (
+            ("replay_token", f"token@{replay_layer}"),
+            ("replay_token_fp16", f"token@{replay_layer}/fp16"),
+            ("replay_token_int8", f"token@{replay_layer}/int8"),
+        ):
+            exact_input_ids = exact_encoded["input_ids"].clone()
+            exact_attention_mask = exact_encoded["attention_mask"].clone()
+            surrogate_input_ids = exact_encoded["input_ids"].clone()
+            surrogate_attention_mask = exact_encoded["attention_mask"].clone()
+            surrogate_steps: list[dict[str, object]] = []
+            first_divergence_step: int | None = None
+            for step in range(steps):
+                exact_logits = self._exact_next_token_logits_from_replay_layer_inputs(
+                    input_ids=exact_input_ids,
+                    attention_mask=exact_attention_mask,
+                    replay_layer=replay_layer,
+                )
+                if surrogate_kind == "replay_token":
+                    surrogate_logits = exact_logits.copy()
+                else:
+                    surrogate_logits = self._surrogate_replay_token_next_token_logits_from_inputs(
+                        input_ids=surrogate_input_ids,
+                        attention_mask=surrogate_attention_mask,
+                        replay_layer=replay_layer,
+                        surrogate_kind=surrogate_kind,
+                        token_index=-1,
+                    )
+                exact_token_id = int(np.argmax(exact_logits))
+                surrogate_token_id = int(np.argmax(surrogate_logits))
+                token_match = exact_token_id == surrogate_token_id
+                if first_divergence_step is None and not token_match:
+                    first_divergence_step = step + 1
+                exact_top_k = self._top_k_tokens(exact_logits, top_k=top_k)
+                surrogate_top_k = self._top_k_tokens(surrogate_logits, top_k=top_k)
+                exact_top_ids = {row[0] for row in exact_top_k}
+                surrogate_top_ids = {row[0] for row in surrogate_top_k}
+                delta = surrogate_logits - exact_logits
+                surrogate_steps.append(
+                    {
+                        "step": step + 1,
+                        "token_match": token_match,
+                        "topk_overlap": len(exact_top_ids & surrogate_top_ids),
+                        "topk_size": top_k,
+                        "exact_token_id": exact_token_id,
+                        "exact_token_text": self.tokenizer.decode([exact_token_id]),
+                        "compact_token_id": surrogate_token_id,
+                        "compact_token_text": self.tokenizer.decode([surrogate_token_id]),
+                        "l2_error": float(np.linalg.norm(delta)),
+                        "max_abs_diff": float(np.max(np.abs(delta))),
+                    }
+                )
+                exact_next = self._torch.tensor([[exact_token_id]], device=self.device, dtype=exact_input_ids.dtype)
+                exact_mask_next = self._torch.ones((1, 1), device=self.device, dtype=exact_attention_mask.dtype)
+                exact_input_ids = self._torch.cat([exact_input_ids, exact_next], dim=1)
+                exact_attention_mask = self._torch.cat([exact_attention_mask, exact_mask_next], dim=1)
+                surrogate_next = self._torch.tensor(
+                    [[surrogate_token_id]],
+                    device=self.device,
+                    dtype=surrogate_input_ids.dtype,
+                )
+                surrogate_mask_next = self._torch.ones((1, 1), device=self.device, dtype=surrogate_attention_mask.dtype)
+                surrogate_input_ids = self._torch.cat([surrogate_input_ids, surrogate_next], dim=1)
+                surrogate_attention_mask = self._torch.cat([surrogate_attention_mask, surrogate_mask_next], dim=1)
+
+            token_matches = sum(1 for row in surrogate_steps if row["token_match"])
+            full_topk_steps = sum(1 for row in surrogate_steps if row["topk_overlap"] == row["topk_size"])
+            rows.append(
+                {
+                    "object_kind": surrogate_kind,
+                    "object_label": surrogate_label,
+                    "delta_depth": None,
+                    "kept_layers": [replay_layer],
+                    "token_agreement": token_matches / len(surrogate_steps) if surrogate_steps else 0.0,
+                    "topk_full_steps": full_topk_steps,
+                    "steps_completed": len(surrogate_steps),
+                    "first_divergence_step": first_divergence_step,
+                    "final_l2_error": surrogate_steps[-1]["l2_error"] if surrogate_steps else 0.0,
+                    "final_max_abs_diff": surrogate_steps[-1]["max_abs_diff"] if surrogate_steps else 0.0,
+                    "exact_text": self.tokenizer.decode(exact_input_ids[0].detach().cpu().tolist()),
+                    "compact_text": self.tokenizer.decode(surrogate_input_ids[0].detach().cpu().tolist()),
+                    "per_step": surrogate_steps,
+                }
+            )
+
+        rows.sort(key=lambda row: (-1 if row["delta_depth"] is None else row["delta_depth"]))
         return {
             "boundary_layer": boundary_layer,
             "replay_layer": replay_layer,

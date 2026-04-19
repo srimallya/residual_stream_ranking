@@ -173,28 +173,36 @@ Depths tested:
 - `0` through `5`
 - full local band at this cut is `depth 5` = deltas `7,8,9,10,11`
 
-Observed result:
+Observed result after fixing the GPT-2 trace contract:
 
-- no tested compact object at replay layer `11` was continuation-safe on the fixed prompt-family panel
-- even the full local band (`7,8,9,10,11`) failed early across every prompt family
-- top-5 full-overlap steps stayed at `0/20` for the full local band on the tested panel
+- the full local band (`7,8,9,10,11`) is continuation-safe across the fixed prompt-family panel
+- thinner objects remain unsafe and prompt-family-dependent
 
-Representative result for the full local band:
+Representative result:
 
-| Prompt Family | Token Agreement / 20 | First Divergence Step | Top-5 Full-Overlap Steps | Current Read |
-| --- | ---: | ---: | ---: | --- |
-| factual-simple | `0.15` | `2` | `0/20` | Not safe |
-| factual-compositional | `0.05` | `1` | `0/20` | Not safe |
-| narrative | `0.10` | `1` | `0/20` | Not safe |
-| procedural / instruction-like | `0.00` | `1` | `0/20` | Not safe |
-| code-like completion | `0.05` | `2` | `0/20` | Not safe |
+| Object Kept | Prompt Family | Token Agreement / 20 | First Divergence Step | Top-5 Full-Overlap Steps | Current Read |
+| --- | --- | ---: | ---: | ---: | --- |
+| `depth 0` | factual-simple | `0.00` | `1` | `0/20` | Too thin |
+| `depth 4` (`8,9,10,11`) | factual-simple | `0.40` | `7` | `5/20` | Unsafe |
+| `depth 5` (`7,8,9,10,11`) | factual-simple | `1.00` | none | `20/20` | Safe |
+| `depth 0` | factual-compositional | `0.00` | `1` | `0/20` | Too thin |
+| `depth 4` (`8,9,10,11`) | factual-compositional | `0.60` | `13` | `9/20` | Unsafe |
+| `depth 5` (`7,8,9,10,11`) | factual-compositional | `1.00` | none | `20/20` | Safe |
+| `depth 0` | narrative | `0.00` | `1` | `0/20` | Too thin |
+| `depth 4` (`8,9,10,11`) | narrative | `0.35` | `6` | `5/20` | Unsafe |
+| `depth 5` (`7,8,9,10,11`) | narrative | `1.00` | none | `20/20` | Safe |
+| `depth 0` | procedural / instruction-like | `0.00` | `1` | `0/20` | Too thin |
+| `depth 4` (`8,9,10,11`) | procedural / instruction-like | `0.40` | `9` | `4/20` | Unsafe |
+| `depth 5` (`7,8,9,10,11`) | procedural / instruction-like | `1.00` | none | `20/20` | Safe |
+| `depth 0` | code-like completion | `0.00` | `1` | `0/20` | Too thin |
+| `depth 4` (`8,9,10,11`) | code-like completion | `1.00` | none | `11/20` | Tokens stable, ranking not stable |
+| `depth 5` (`7,8,9,10,11`) | code-like completion | `1.00` | none | `20/20` | Safe |
 
 ### What The Replay-Layer Probe Means
 
-- replay-layer locality matters, not just delta depth
-- the current "safe full local band" story holds at replay layers `9` and `10`
-- that story does **not** hold at replay layer `11`
-- therefore, the compact replay frontier depends on where the replay object re-enters the stack, not just how much late-band information it keeps
+- replay-layer locality still matters, but the earlier "layer 11 is impossible" result was a trace-contract bug, not a real compact frontier fact
+- after fixing GPT-2 tracing to record pre-`ln_f` block outputs consistently, the current "safe full local band" story holds at replay layers `9`, `10`, and `11`
+- thinner objects remain replay-layer- and prompt-family-sensitive
 
 ## Current Mechanism Read
 
@@ -205,12 +213,129 @@ On the tested GPT-2 compact frontier:
 - replay layer `10`:
   - full local band `7,8,9,10` is continuation-safe
 - replay layer `11`:
-  - even the full local band `7,8,9,10,11` is not continuation-safe
+  - full local band `7,8,9,10,11` is continuation-safe
 
-So the current safe-object story is more specific than "keep the full late band":
+So the current safe-object story is:
 
-- a full local late band is sufficient at some replay layers
-- but not at all replay layers
+- a full local late band is sufficient at the tested replay layers `9`, `10`, and `11`
+- thinner objects remain unsafe in replay-layer- and prompt-family-specific ways
+
+## Reduced-Object Failure Map
+
+With the full local band restored as the safe reference object, the next useful question is how thinner objects fail across replay layers and prompt families.
+
+This section summarizes the reduced objects only:
+
+- replay layer `9`: depths `0`, `1`, `2`
+- replay layer `10`: depths `0`, `1`, `2`, `3`
+- replay layer `11`: depths `0`, `1`, `2`, `3`, `4`
+
+The full-band object at each replay layer is excluded here because it is the safe reference.
+
+### Headline Pattern
+
+- every reduced object is continuation-unsafe somewhere on the fixed prompt-family panel
+- deeper reduced objects are often better, but not smoothly or universally better
+- code-like prompts are the most forgiving at the token level
+- narrative and procedural prompts expose instability early
+
+### Best Reduced Object By Replay Layer
+
+| Replay Layer | Best Reduced Object | What It Preserves | Why It Is Still Unsafe |
+| --- | --- | --- | --- |
+| `9` | `depth 2` (`8,9`) | code-like token agreement `1.00`, `11/20` top-5 full-overlap steps | factual, narrative, and procedural families still diverge early |
+| `10` | `depth 3` (`8,9,10`) | factual-simple and code-like token agreement `1.00`, `11/20` top-5 full-overlap steps | factual-compositional degrades, narrative collapses, procedural only partly survives |
+| `11` | `depth 4` (`8,9,10,11`) | code-like token agreement `1.00`, `11/20` top-5 full-overlap steps | factual, narrative, and procedural families still diverge materially |
+
+### Failure Characteristics By Prompt Family
+
+| Prompt Family | Typical Reduced-Object Failure Shape |
+| --- | --- |
+| factual-simple | reduced objects can preserve tokens for a while, but ranking degrades early unless the full band is present |
+| factual-compositional | reduced objects degrade faster than simple factual prompts; partial bands are not reliably safe |
+| narrative | harsh stress test; seemingly strong reduced objects can collapse almost immediately |
+| procedural / instruction-like | early collapse even after good one-step behavior; reduced objects are not trustworthy here |
+| code-like completion | most forgiving for token agreement; still exposes ranking instability clearly |
+
+### Current Practical Read
+
+- if the objective is continuation safety, use the full local band at the tested replay cut
+- if the objective is exploratory compression only, code-like and simple factual prompts can flatter reduced objects
+- but reduced-object success on those easier families does not generalize across the fixed panel
+
+## Alternative Object Class: Direct Replay Token
+
+The late-band family is not the only compact object class.
+
+A qualitatively different object is:
+
+- the exact target-token state at the replay layer itself
+
+In the current compact setup, prefix states at the replay layer are already kept exact. That means the direct replay-token object can be evaluated cleanly against the same continuation baseline.
+
+### Why It Matters
+
+This object class is much smaller than the full local late band:
+
+| Replay Layer | Direct Replay Token | Full Local Late Band |
+| --- | ---: | ---: |
+| `9` | `3,072` bytes | `12,288` bytes |
+| `10` | `3,072` bytes | `15,360` bytes |
+| `11` | `3,072` bytes | `18,432` bytes |
+
+And it is continuation-safe by construction on the tested panel, because it restores the exact token state at the replay cut.
+
+### Current Read
+
+- the plain "thinner late band" family is not generally safe
+- but a different compact object class does exist:
+  - direct replay token at the replay layer
+- so the next object-design question is no longer:
+  - "can anything smaller than the full band work?"
+- it is now:
+  - "can we find a compact object class that approaches direct replay-token fidelity without requiring the exact replay-layer token itself?"
+
+## Replay-Token Surrogates
+
+The next surrogate family tested was a direct compression of the replay token itself.
+
+Tested at replay layer `10` on the fixed prompt-family panel:
+
+- `token@10`: exact replay token (`3,072` bytes)
+- `token@10/fp16`: replay token stored in `float16` (`1,536` bytes)
+- `token@10/int8`: replay token stored as symmetric int8 plus one float32 scale (`772` bytes)
+
+### 10-Step Result
+
+| Object | Bytes | Prompt Family | Token Agreement / 10 | Top-5 Full-Overlap Steps | Current Read |
+| --- | ---: | --- | ---: | ---: | --- |
+| `token@10` | `3,072` | all tested families | `1.00` | `10/10` | Exact reference |
+| `token@10/fp16` | `1,536` | factual-simple | `1.00` | `10/10` | Safe |
+| `token@10/fp16` | `1,536` | factual-compositional | `1.00` | `10/10` | Safe |
+| `token@10/fp16` | `1,536` | narrative | `1.00` | `10/10` | Safe |
+| `token@10/fp16` | `1,536` | procedural / instruction-like | `1.00` | `10/10` | Safe |
+| `token@10/fp16` | `1,536` | code-like completion | `1.00` | `10/10` | Safe |
+| `token@10/int8` | `772` | factual-simple | `1.00` | `8/10` | Tokens stable, small ranking loss |
+| `token@10/int8` | `772` | factual-compositional | `1.00` | `10/10` | Safe on tested horizon |
+| `token@10/int8` | `772` | narrative | `1.00` | `8/10` | Tokens stable, ranking loss |
+| `token@10/int8` | `772` | procedural / instruction-like | `1.00` | `9/10` | Tokens stable, minor ranking loss |
+| `token@10/int8` | `772` | code-like completion | `1.00` | `9/10` | Tokens stable, minor ranking loss |
+
+### What This Changes
+
+- a viable compressed replay-token family already exists
+- `fp16` replay-token storage cuts the exact replay-token object in half while preserving continuation behavior on the tested panel
+- even simple `int8` replay-token storage is much stronger than thinner late bands:
+  - token agreement remains perfect on the tested panel
+  - ranking fidelity degrades slightly, but far less catastrophically than the late-band reductions
+
+### Current Compression Read
+
+- if exact replay-token storage is allowed, `fp16` is already a strong practical surrogate
+- if more aggressive compression is needed, `int8` replay-token storage is the first credible lossy candidate
+- this means the next compression problem is now more specific:
+  - not "compress late bands more"
+  - but "compress the replay token better"
 
 ## Next Widening
 

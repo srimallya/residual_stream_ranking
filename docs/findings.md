@@ -821,10 +821,46 @@ Replay-layer probe:
 - the next mechanism probe held the same fixed prompt-family panel and `20`-step horizon while shifting replay layer:
   - replay layer `9`
   - replay layer `11`
-- result:
+- initial replay-layer-`11` failure turned out to be contaminated by a GPT-2 trace-contract bug:
+  - `trace_text()` had been reading the model's final hidden-state slot rather than the pre-`ln_f` block-`11` output
+  - this made replay layer `11` mean different tensors in different code paths
+- after switching GPT-2 tracing to explicit manual block stepping, replay layer `11` was re-run
+- corrected result:
   - replay layer `9`: the full local band `7,8,9` is continuation-safe across the tested panel
   - replay layer `10`: the full local band `7,8,9,10` remains continuation-safe across the tested panel
-  - replay layer `11`: even the full local band `7,8,9,10,11` is not continuation-safe across the tested panel
-- this sharpens the mechanism claim:
-  - compact stability depends on replay-layer location, not just delta-band width
-  - the safe-object story is local to particular replay cuts rather than universally "keep the whole late band"
+  - replay layer `11`: the full local band `7,8,9,10,11` is also continuation-safe across the tested panel
+- corrected mechanism claim:
+  - the safe-object story is again "full local band at the tested replay cut is sufficient"
+  - replay-layer location still matters for thinner objects, but layer `11` is no longer an exception
+
+Reduced-object map:
+
+- with the full local band restored as the safe reference object, the current compact question is now squarely about reduced-object failure modes
+- a reduced-object matrix was run across replay layers `9/10/11` on the fixed prompt-family panel
+- current read:
+  - every reduced object is continuation-unsafe somewhere on the panel
+  - code-like prompts remain the most forgiving at the token level
+  - narrative and procedural prompts remain the hardest stress tests
+  - deeper reduced objects help, but not in a smooth or universally reliable way
+
+Alternative object class:
+
+- a qualitatively different compact object class was added to the comparison surface:
+  - direct replay token at the replay layer
+- this object is continuation-safe by construction in the current setup and much smaller than the full local late band:
+  - `3,072` bytes versus `12,288` / `15,360` / `18,432` bytes at replay layers `9` / `10` / `11`
+- this changes the next design question:
+  - the problem is no longer "is anything smaller than the full band possible?"
+  - it is now "can a compressed object class approach direct replay-token fidelity without storing the exact replay-layer token?"
+
+Replay-token surrogates:
+
+- the next surrogate family compressed the replay token itself rather than the late-band trace
+- tested at replay layer `10` on the fixed prompt-family panel:
+  - `token@10/fp16`: `1,536` bytes
+  - `token@10/int8`: `772` bytes
+- result:
+  - `fp16` replay-token storage preserved continuation behavior across the tested panel
+  - `int8` replay-token storage preserved token agreement across the tested panel, with only modest top-k degradation
+- updated design axis:
+  - the most promising compact branch is now replay-token compression, not further late-band thinning
