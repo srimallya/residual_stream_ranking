@@ -253,7 +253,7 @@ Bridge routed Apollo selection into tracked replay evaluation:
   --replay-steps 10
 ```
 
-`bridge-apollo-replay` keeps the staged Apollo router (`semantic pool -> temporal/PageRank rerank -> graph-local refinement`) and, on routed top-1 hits, scores tracked replay objects alongside a plain `text@window` control on the selected region.
+`bridge-apollo-replay` keeps the staged Apollo router (`semantic pool -> temporal/PageRank rerank -> graph-local refinement`) and, on routed top-1 hits, scores tracked replay objects alongside a plain `text@window` control on the selected region. The command now also emits a read-only memory ledger report with tier counts, the low-utility tail, and reporting-only archive/prune suggestions for the replay objects it observed.
 
 ## Interpreting Results
 
@@ -280,14 +280,15 @@ The current benchmark evidence supports this decomposition:
 - quality depends heavily on the selected model and embedding behavior
 - true hidden-state injection is currently implemented only for a narrow GPT-2-class phase 2A verification path
 - compact replay is currently a narrow target-token experiment, not yet a general continuation path
+- the memory ledger is currently observability-only; it reports tier suggestions but does not demote, archive, or prune anything yet
 - the bundled GGUF models are local dependencies and are not intended to be committed to git
 
 ## Roadmap
 
 Likely next steps from the current state:
 
-1. Improve replay packet quality on the staged-hit-but-wrong slice.
-2. Test larger local neighborhoods and packet enrichment against the medium-distance bucket.
+1. Turn the new memory ledger into an actual lifecycle layer with conservative warm/cold/archive transitions.
+2. Stress `token@10/fp16` on harder routed slices before trying smarter lossy replay-token codecs.
 3. Run context-budget ablations such as `4096` vs `8192`.
 4. Broaden the HF trace backend beyond the current verification path and harden resumed-forward agreement checks.
 5. Add next-token continuation after resumed execution.

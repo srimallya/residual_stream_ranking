@@ -1094,3 +1094,44 @@ Updated bridge conclusion:
 
 - `token@10/fp16` has now survived the routed bridge under both wider slices and a doubled continuation horizon, and remains behaviorally welded to the exact/text/full-band group on the tested Apollo envelope
 - `token@10/int8` remains the first repeatedly demonstrated lossy failure boundary and continues to degrade across all routed difficulty buckets when the bridge is stressed harder
+
+Memory ledger skeleton:
+
+- the bridge now includes an observability-only memory ledger layer instead of treating replay objects as disposable benchmark rows
+- a new `memory_ledger.py` module defines a stable `MemoryObject` schema with:
+  - `object_id`
+  - `kind`
+  - `bytes`
+  - `rank_history`
+  - `topk_frequency`
+  - `downstream_utility`
+  - `replay_usage_count`
+  - `created_at`
+  - `last_retrieved_at`
+  - `last_reinjected_at`
+  - `last_useful_at`
+  - `jump_score`
+  - `tier`
+  - `pinned`
+  - `source_case_id`
+  - `source_region_id`
+- `bridge-apollo-replay` now updates that ledger passively on every routed top-1 replay evaluation without changing replay behavior
+- the bridge output now includes a read-only tier report:
+  - object counts by tier
+  - recent promotions / demotions
+  - low-utility tail
+  - reporting-only archive/prune candidates
+  - pinned objects
+
+Current lifecycle policy:
+
+- default everything to `warm`
+- allow explicit `pinned`
+- report `cold` / `archived` suggestions only
+- do not auto-demote, archive, or prune anything yet
+
+Current value of the ledger:
+
+- the repo now has the protocol substrate for bounded live cognition plus routed autobiographical recall
+- replay selection and replay quality can be observed as memory-object behavior, not just benchmark rows
+- policy can now be added later without first rebuilding the data model or the bridge instrumentation

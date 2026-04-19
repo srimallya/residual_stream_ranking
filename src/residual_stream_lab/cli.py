@@ -16,6 +16,7 @@ from residual_stream_lab.checkpointing import (
 from residual_stream_lab.llm import GGUFRunner
 from residual_stream_lab.hf_trace import HFTraceRunner
 from residual_stream_lab.apollo import ApolloCase, build_apollo_cases
+from residual_stream_lab.memory_ledger import MemoryLedger
 from residual_stream_lab.synthetic import BenchmarkCase, build_benchmark_case
 from residual_stream_lab.temporal import rerank_checkpoints
 from residual_stream_lab.trace import verify_reconstruction
@@ -609,6 +610,7 @@ def evaluate_routed_replay_bridge(
     rerank_strategy: str = "staged",
     replay_top_k: int = 5,
 ) -> dict[str, object]:
+    ledger = MemoryLedger()
     object_order = [
         "text@window",
         f"token@{replay_layer}",
@@ -678,6 +680,7 @@ def evaluate_routed_replay_bridge(
 
         if top1_hit and ranked:
             routed_window_text = ranked[0].window.text
+            source_region_id = f"{case.case_id}:window:{ranked[0].window.index}"
             replay_result = replay_runner.compare_compact_continuation_variants(
                 text=routed_window_text,
                 boundary_layer=replay_boundary_layer,
@@ -718,6 +721,23 @@ def evaluate_routed_replay_bridge(
                 distance_aggregate["divergence_count"] += int(row["first_divergence_step"] is not None)
                 if distance_aggregate["compact_bytes"] == 0:
                     distance_aggregate["compact_bytes"] = int(row["compact_bytes"])
+                ledger.register_event(
+                    object_id=f"{case.case_id}:{label}",
+                    kind=label,
+                    bytes=int(row["compact_bytes"]),
+                    source_case_id=case.case_id,
+                    source_region_id=source_region_id,
+                    rank=1,
+                    retrieved=True,
+                    entered_topk=True,
+                    reinjected=True,
+                    behavior_helped=(
+                        float(row["token_agreement"]) == 1.0
+                        and int(row["topk_full_steps"]) == int(row["steps_completed"])
+                        and row["first_divergence_step"] is None
+                    ),
+                    pinned=False,
+                )
 
         per_case.append(case_row)
 
@@ -765,6 +785,7 @@ def evaluate_routed_replay_bridge(
         "replay_steps": replay_steps,
         "summary_rows": summary_rows,
         "distance_summary": distance_summary,
+        "memory_ledger": ledger.report(),
         "per_case": per_case,
     }
 
@@ -2025,6 +2046,93 @@ def bridge_apollo_replay(
                 f"{row['divergence_rate']:.2f}",
             )
         console.print(distance_table)
+
+    ledger = summary["memory_ledger"]
+
+    tier_table = Table(title="Memory Ledger Tiers")
+    tier_table.add_column("Tier")
+    tier_table.add_column("Count")
+    for tier_name in ["pinned", "warm", "cold", "archived", "pruned"]:
+        tier_table.add_row(tier_name, str(ledger["tier_counts"].get(tier_name, 0)))
+    console.print(tier_table)
+
+    recent_changes = ledger["recent_tier_changes"]
+    if recent_changes:
+        change_table = Table(title="Recent Tier Changes")
+        change_table.add_column("Object")
+        change_table.add_column("From")
+        change_table.add_column("To")
+        change_table.add_column("Changed At")
+        for row in recent_changes:
+            change_table.add_row(
+                str(row["object_id"]),
+                str(row["previous_tier"]),
+                str(row["new_tier"]),
+                str(row["changed_at"]),
+            )
+        console.print(change_table)
+    else:
+        console.print("[bold]Recent Tier Changes[/bold]\nNone yet (reporting-only ledger; no demotions or promotions applied).")
+
+    low_utility_tail = ledger["low_utility_tail"]
+    if low_utility_tail:
+        low_utility_table = Table(title="Low-Utility Tail")
+        low_utility_table.add_column("Object")
+        low_utility_table.add_column("Kind")
+        low_utility_table.add_column("Tier")
+        low_utility_table.add_column("Utility")
+        low_utility_table.add_column("Top-K Freq")
+        low_utility_table.add_column("Replay Uses")
+        for row in low_utility_tail:
+            low_utility_table.add_row(
+                str(row["object_id"]),
+                str(row["kind"]),
+                str(row["tier"]),
+                f"{row['downstream_utility']:.0f}",
+                f"{row['topk_frequency']:.2f}",
+                str(row["replay_usage_count"]),
+            )
+        console.print(low_utility_table)
+
+    archive_candidates = ledger["archive_candidates"]
+    if archive_candidates:
+        archive_table = Table(title="Archive / Prune Candidates (Reporting Only)")
+        archive_table.add_column("Object")
+        archive_table.add_column("Kind")
+        archive_table.add_column("Current")
+        archive_table.add_column("Suggested")
+        archive_table.add_column("Utility")
+        archive_table.add_column("Replay Uses")
+        archive_table.add_column("Top-K Freq")
+        for row in archive_candidates:
+            archive_table.add_row(
+                str(row["object_id"]),
+                str(row["kind"]),
+                str(row["current_tier"]),
+                str(row["suggested_tier"]),
+                f"{row['downstream_utility']:.0f}",
+                str(row["replay_usage_count"]),
+                f"{row['topk_frequency']:.2f}",
+            )
+        console.print(archive_table)
+
+    pinned_objects = ledger["pinned_objects"]
+    if pinned_objects:
+        pinned_table = Table(title="Pinned Objects")
+        pinned_table.add_column("Object")
+        pinned_table.add_column("Kind")
+        pinned_table.add_column("Tier")
+        pinned_table.add_column("Bytes")
+        for row in pinned_objects:
+            pinned_table.add_row(
+                str(row["object_id"]),
+                str(row["kind"]),
+                str(row["tier"]),
+                str(row["bytes"]),
+            )
+        console.print(pinned_table)
+    else:
+        console.print("[bold]Pinned Objects[/bold]\nNone in this bridge run.")
 
 
 if __name__ == "__main__":
