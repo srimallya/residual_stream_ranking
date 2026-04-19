@@ -14,7 +14,13 @@ This is intentionally a prototype for ranking and replay behavior. It does not c
 
 ## What It Does
 
-The CLI command `residual-lab benchmark` runs a synthetic long-context recall benchmark with four modes:
+The CLI exposes three useful evaluation paths:
+
+- `residual-lab benchmark`: synthetic long-context recall benchmark
+- `residual-lab benchmark-apollo`: corpus-backed Apollo benchmark with parse-valid full/oracle gating
+- `residual-lab route-apollo`: routing-only Apollo comparison for reranker ablations
+
+The benchmark modes are:
 
 - `full`: pass the full document to the model
 - `recent`: pass only the most recent windows
@@ -39,10 +45,14 @@ Today only the semantic payload is populated. The trace payload exists to make t
 - semantic payload answers: "which past region should I retrieve?"
 - trace payload answers: "if the backend exposes the right internals, what exact state pieces could I reconstruct?"
 
-The benchmark also reports two diagnostic metrics:
+The Apollo evaluator also reports routing diagnostics:
 
-- target hit rate: whether the target historical window was selected at all
-- oracle-correct memory accuracy: answer quality when the correct old checkpoint is injected directly
+- target hit rate
+- oracle-correct memory accuracy
+- top-1 / top-2 / top-4 recall
+- mean reciprocal rank (MRR)
+- parse given hit
+- correct given hit and parse
 
 ## Project Layout
 
@@ -58,7 +68,8 @@ src/residual_stream_lab/
 tests/
   test_trace.py      trace reconstruction contract tests
 models/
-  Qwen3.5-2B-Q8_0.gguf
+  Qwen3.5-2B-GGUF/
+  Qwen3.5-4B-GGUF/
 ```
 
 ## Requirements
@@ -78,16 +89,43 @@ If you are not using `uv`, you can install the package with standard `pip` insid
 
 ## Usage
 
-Run the benchmark against the bundled model:
+Run the synthetic benchmark:
 
 ```bash
-.venv/bin/residual-lab \
+.venv/bin/residual-lab benchmark \
   --model-path models/Qwen3.5-2B-Q8_0.gguf \
   --windows 8 \
   --window-lines 6 \
   --recent-windows 2 \
   --top-k 2 \
   --queries 8
+```
+
+Run the Apollo corpus benchmark:
+
+```bash
+.venv/bin/residual-lab benchmark-apollo \
+  --model-path models/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf \
+  --corpus-path data/apollo11_clean.txt \
+  --case-count 12 \
+  --windows 12 \
+  --window-lines 24 \
+  --recent-windows 2 \
+  --top-k 2 \
+  --n-ctx 4096
+```
+
+Run the Apollo routing-only ablation:
+
+```bash
+.venv/bin/residual-lab route-apollo \
+  --model-path models/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf \
+  --corpus-path data/apollo11_clean.txt \
+  --case-count 6 \
+  --windows 12 \
+  --window-lines 24 \
+  --recent-windows 2 \
+  --n-ctx 4096
 ```
 
 Useful flags:

@@ -69,8 +69,7 @@ class GGUFRunner:
         if "</think>" in normalized:
             normalized = normalized.split("</think>", 1)[1].strip()
         normalized = re.sub(r"^Teal\\.cw$", "Teal", normalized, flags=re.IGNORECASE)
-        lines = [line.strip() for line in normalized.splitlines() if line.strip()]
-        return lines[-1] if lines else normalized
+        return normalized
 
     def complete(
         self,

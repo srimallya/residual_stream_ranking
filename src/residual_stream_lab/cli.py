@@ -29,6 +29,7 @@ def select_checkpoints(
     recent_windows: int,
     top_k: int,
     runner: GGUFRunner,
+    rerank_strategy: str = "hybrid",
 ) -> tuple[list[str], list[int]]:
     windows = split_windows(benchmark.document, lines_per_window=benchmark.window_lines)
     checkpoints = build_checkpoints(windows, runner.embed)
@@ -58,6 +59,7 @@ def select_checkpoints(
             top_k=top_k,
             exclude_window_ids=recent_ids,
             recent_windows=recent_checkpoints,
+            strategy=rerank_strategy,
         )
         selected.extend(recent_checkpoints)
     else:
@@ -144,6 +146,7 @@ def evaluate_case_modes(
     runner: GGUFRunner,
     recent_windows: int,
     top_k: int,
+    rerank_strategy: str = "hybrid",
 ) -> tuple[list[dict[str, object]], dict[str, dict[str, dict[str, float]]]]:
     valid_answers = {case.answer.lower() for case in cases}
     per_case: list[dict[str, object]] = []
@@ -156,6 +159,7 @@ def evaluate_case_modes(
             recent_windows=recent_windows,
             top_k=top_k,
             runner=runner,
+            rerank_strategy=rerank_strategy,
         )
         recent_tokens = runner.token_count(recent_memory)
 
@@ -166,6 +170,7 @@ def evaluate_case_modes(
             recent_windows=recent_windows,
             top_k=top_k,
             runner=runner,
+            rerank_strategy=rerank_strategy,
         )
         oracle_memory = build_oracle_memory(
             benchmark=case,
@@ -175,6 +180,32 @@ def evaluate_case_modes(
         )
 
         mode_results: dict[str, dict[str, object]] = {}
+        checkpoints = build_checkpoints(
+            split_windows(case.document, lines_per_window=case.window_lines),
+            runner.embed,
+        )
+        recent = split_windows(case.document, lines_per_window=case.window_lines)[-recent_windows:] if recent_windows > 0 else []
+        recent_ids = {window.index for window in recent}
+        query_embedding = runner.embed(case.question)
+        ranking_orders: dict[str, list[int]] = {}
+        retrieval_candidates = retrieve_checkpoints(
+            checkpoints,
+            query_embedding=query_embedding,
+            top_k=max(4, top_k),
+            exclude_window_ids=recent_ids,
+        )
+        ranking_orders["retrieval"] = [checkpoint.window.index for checkpoint in retrieval_candidates]
+        temporal_candidates = rerank_checkpoints(
+            checkpoints,
+            query_embedding=query_embedding,
+            query_text=case.question,
+            top_k=max(4, top_k),
+            exclude_window_ids=recent_ids,
+            recent_windows=[checkpoint for checkpoint in checkpoints if checkpoint.window.index in recent_ids],
+            strategy=rerank_strategy,
+        )
+        ranking_orders["temporal"] = [checkpoint.window.index for checkpoint in temporal_candidates]
+
         for mode, memory, selected_ids in [
             ("full", full_memory, full_ids),
             ("recent", recent_memory, []),
@@ -200,6 +231,7 @@ def evaluate_case_modes(
                 recent_windows=recent_windows,
                 top_k=top_k,
                 runner=runner,
+                rerank_strategy=rerank_strategy,
             )
             result = evaluate_response(
                 runner=runner,
@@ -213,18 +245,16 @@ def evaluate_case_modes(
             result["replay_tokens"] = max(0, result["memory_tokens"] - recent_tokens)
             mode_results[mode] = result
 
-        retrieval_topk: dict[str, bool] = {}
-        for k in [1, 2, 4]:
-            _, topk_ids = select_checkpoints(
-                mode="retrieval",
-                benchmark=case,
-                query=case.question,
-                recent_windows=recent_windows,
-                top_k=k,
-                runner=runner,
+        for mode in ["retrieval", "temporal"]:
+            ranked_ids = ranking_orders[mode]
+            mode_results[mode]["topk"] = {
+                f"top_{k}": case.target_window_index in ranked_ids[:k] for k in [1, 2, 4]
+            }
+            mode_results[mode]["mrr"] = (
+                1.0 / (ranked_ids.index(case.target_window_index) + 1)
+                if case.target_window_index in ranked_ids
+                else 0.0
             )
-            retrieval_topk[f"top_{k}"] = case.target_window_index in topk_ids
-        mode_results["retrieval"]["topk"] = retrieval_topk
 
         valid = mode_results["full"]["parse_success"] and mode_results["oracle"]["parse_success"]
         per_case.append(
@@ -260,39 +290,60 @@ def evaluate_case_modes(
             "avg_replay_tokens": avg_replay,
         }
 
-    if valid_count:
-        retrieval_valid = [entry for entry in valid_cases]
-        top1 = sum(entry["results"]["retrieval"]["topk"]["top_1"] for entry in retrieval_valid) / valid_count
-        top2 = sum(entry["results"]["retrieval"]["topk"]["top_2"] for entry in retrieval_valid) / valid_count
-        top4 = sum(entry["results"]["retrieval"]["topk"]["top_4"] for entry in retrieval_valid) / valid_count
-        wrong_window = sum(not entry["results"]["retrieval"]["hit"] for entry in retrieval_valid) / valid_count
-        right_unparsable = sum(
-            entry["results"]["retrieval"]["hit"] and not entry["results"]["retrieval"]["parse_success"]
-            for entry in retrieval_valid
-        ) / valid_count
-        right_parsed_wrong = sum(
-            entry["results"]["retrieval"]["hit"]
-            and entry["results"]["retrieval"]["parse_success"]
-            and not entry["results"]["retrieval"]["correct"]
-            for entry in retrieval_valid
-        ) / valid_count
-        summary["overall"]["retrieval_breakdown"] = {
-            "top1_recall": top1,
-            "top2_recall": top2,
-            "top4_recall": top4,
-            "wrong_window_rate": wrong_window,
-            "right_unparsable_rate": right_unparsable,
-            "right_parsed_wrong_rate": right_parsed_wrong,
-        }
-    else:
-        summary["overall"]["retrieval_breakdown"] = {
-            "top1_recall": 0.0,
-            "top2_recall": 0.0,
-            "top4_recall": 0.0,
-            "wrong_window_rate": 0.0,
-            "right_unparsable_rate": 0.0,
-            "right_parsed_wrong_rate": 0.0,
-        }
+    for breakdown_mode in ["retrieval", "temporal"]:
+        key = f"{breakdown_mode}_breakdown"
+        if valid_count:
+            mode_valid = [entry for entry in valid_cases]
+            top1 = sum(entry["results"][breakdown_mode]["topk"]["top_1"] for entry in mode_valid) / valid_count
+            top2 = sum(entry["results"][breakdown_mode]["topk"]["top_2"] for entry in mode_valid) / valid_count
+            top4 = sum(entry["results"][breakdown_mode]["topk"]["top_4"] for entry in mode_valid) / valid_count
+            wrong_window = sum(not entry["results"][breakdown_mode]["hit"] for entry in mode_valid) / valid_count
+            right_unparsable = sum(
+                entry["results"][breakdown_mode]["hit"] and not entry["results"][breakdown_mode]["parse_success"]
+                for entry in mode_valid
+            ) / valid_count
+            hit_count = sum(entry["results"][breakdown_mode]["hit"] for entry in mode_valid)
+            hit_and_parse_count = sum(
+                entry["results"][breakdown_mode]["hit"] and entry["results"][breakdown_mode]["parse_success"]
+                for entry in mode_valid
+            )
+            right_parsed_wrong = sum(
+                entry["results"][breakdown_mode]["hit"]
+                and entry["results"][breakdown_mode]["parse_success"]
+                and not entry["results"][breakdown_mode]["correct"]
+                for entry in mode_valid
+            ) / valid_count
+            mrr = sum(entry["results"][breakdown_mode]["mrr"] for entry in mode_valid) / valid_count
+            summary["overall"][key] = {
+                "top1_recall": top1,
+                "top2_recall": top2,
+                "top4_recall": top4,
+                "mrr": mrr,
+                "wrong_window_rate": wrong_window,
+                "right_unparsable_rate": right_unparsable,
+                "right_parsed_wrong_rate": right_parsed_wrong,
+                "parse_given_hit": (hit_and_parse_count / hit_count) if hit_count else 0.0,
+                "correct_given_hit_parse": (
+                    sum(
+                        entry["results"][breakdown_mode]["correct"]
+                        for entry in mode_valid
+                        if entry["results"][breakdown_mode]["hit"] and entry["results"][breakdown_mode]["parse_success"]
+                    )
+                    / hit_and_parse_count
+                ) if hit_and_parse_count else 0.0,
+            }
+        else:
+            summary["overall"][key] = {
+                "top1_recall": 0.0,
+                "top2_recall": 0.0,
+                "top4_recall": 0.0,
+                "mrr": 0.0,
+                "wrong_window_rate": 0.0,
+                "right_unparsable_rate": 0.0,
+                "right_parsed_wrong_rate": 0.0,
+                "parse_given_hit": 0.0,
+                "correct_given_hit_parse": 0.0,
+            }
 
     by_distance: dict[str, list[dict[str, object]]] = defaultdict(list)
     for entry in valid_cases:
@@ -311,6 +362,76 @@ def evaluate_case_modes(
     return per_case, summary
 
 
+def evaluate_routing_only(
+    *,
+    cases: list[ApolloCase],
+    runner: GGUFRunner,
+    recent_windows: int,
+    strategy: str,
+) -> dict[str, float]:
+    prepared_cases = []
+    for case in cases:
+        windows = split_windows(case.document, lines_per_window=case.window_lines)
+        checkpoints = build_checkpoints(windows, runner.embed)
+        recent = windows[-recent_windows:] if recent_windows > 0 else []
+        recent_ids = {window.index for window in recent}
+        recent_checkpoints = [checkpoint for checkpoint in checkpoints if checkpoint.window.index in recent_ids]
+        prepared_cases.append(
+            {
+                "case": case,
+                "checkpoints": checkpoints,
+                "recent_ids": recent_ids,
+                "recent_checkpoints": recent_checkpoints,
+                "query_embedding": runner.embed(case.question),
+            }
+        )
+
+    top1 = 0
+    top2 = 0
+    top4 = 0
+    reciprocal_rank_sum = 0.0
+
+    for prepared in prepared_cases:
+        case = prepared["case"]
+        checkpoints = prepared["checkpoints"]
+        recent_ids = prepared["recent_ids"]
+        recent_checkpoints = prepared["recent_checkpoints"]
+        query_embedding = prepared["query_embedding"]
+        if strategy == "semantic":
+            ranked = retrieve_checkpoints(
+                checkpoints,
+                query_embedding=query_embedding,
+                top_k=4,
+                exclude_window_ids=recent_ids,
+            )
+        else:
+            ranked = rerank_checkpoints(
+                checkpoints,
+                query_embedding=query_embedding,
+                query_text=case.question,
+                top_k=4,
+                exclude_window_ids=recent_ids,
+                recent_windows=recent_checkpoints,
+                strategy=strategy,
+            )
+
+        ranked_ids = [checkpoint.window.index for checkpoint in ranked]
+        top1 += int(case.target_window_index in ranked_ids[:1])
+        top2 += int(case.target_window_index in ranked_ids[:2])
+        top4 += int(case.target_window_index in ranked_ids[:4])
+        if case.target_window_index in ranked_ids:
+            reciprocal_rank_sum += 1.0 / (ranked_ids.index(case.target_window_index) + 1)
+
+    count = len(cases)
+    return {
+        "count": float(count),
+        "top1": top1 / count,
+        "top2": top2 / count,
+        "top4": top4 / count,
+        "mrr": reciprocal_rank_sum / count,
+    }
+
+
 @app.command()
 def benchmark(
     model_path: str = typer.Option(..., help="Path to the GGUF model."),
@@ -321,6 +442,7 @@ def benchmark(
     queries: int = typer.Option(8, min=1, help="Number of evaluation questions."),
     seed: int = typer.Option(7, help="Deterministic synthetic seed."),
     n_ctx: int = typer.Option(4096, min=1024, help="Inference context size."),
+    rerank_strategy: str = typer.Option("hybrid", help="Rerank strategy for temporal mode."),
 ) -> None:
     benchmark_case = build_benchmark_case(
         windows=windows,
@@ -371,6 +493,7 @@ def benchmark(
                 recent_windows=recent_windows,
                 top_k=top_k,
                 runner=runner,
+                rerank_strategy=rerank_strategy,
             )
             prediction = runner.answer_question(memory=memory, question=query_case.question)
             parsed = extract_atomic_answer(prediction, valid_answers)
@@ -450,6 +573,7 @@ def benchmark_apollo(
     top_k: int = typer.Option(2, min=1, help="Retrieved checkpoint count."),
     seed: int = typer.Option(7, help="Deterministic benchmark seed."),
     n_ctx: int = typer.Option(4096, min=1024, help="Inference context size."),
+    rerank_strategy: str = typer.Option("hybrid", help="Rerank strategy for temporal mode."),
 ) -> None:
     runner = GGUFRunner(model_path=model_path, n_ctx=n_ctx)
     cases = build_apollo_cases(
@@ -465,6 +589,7 @@ def benchmark_apollo(
         runner=runner,
         recent_windows=recent_windows,
         top_k=top_k,
+        rerank_strategy=rerank_strategy,
     )
 
     valid_count = sum(1 for entry in per_case if entry["valid"])
@@ -527,19 +652,36 @@ def benchmark_apollo(
             "At least one sample failed the full/oracle answer contract, so memory deltas must be interpreted cautiously."
         )
 
-    breakdown = summary["overall"]["retrieval_breakdown"]
-    breakdown_table = Table(title="Retrieval Breakdown")
+    breakdown_table = Table(title="Routing Breakdown")
     breakdown_table.add_column("Metric")
-    breakdown_table.add_column("Value")
-    for label, value in [
-        ("Top-1 recall", breakdown["top1_recall"]),
-        ("Top-2 recall", breakdown["top2_recall"]),
-        ("Top-4 recall", breakdown["top4_recall"]),
-        ("Wrong window rate", breakdown["wrong_window_rate"]),
-        ("Right window, unparsable", breakdown["right_unparsable_rate"]),
-        ("Right window, parsed wrong", breakdown["right_parsed_wrong_rate"]),
+    breakdown_table.add_column("Retrieval")
+    breakdown_table.add_column("Temporal")
+    retrieval_breakdown = summary["overall"]["retrieval_breakdown"]
+    temporal_breakdown = summary["overall"]["temporal_breakdown"]
+    for label, retrieval_value, temporal_value in [
+        ("Top-1 recall", retrieval_breakdown["top1_recall"], temporal_breakdown["top1_recall"]),
+        ("Top-2 recall", retrieval_breakdown["top2_recall"], temporal_breakdown["top2_recall"]),
+        ("Top-4 recall", retrieval_breakdown["top4_recall"], temporal_breakdown["top4_recall"]),
+        ("MRR", retrieval_breakdown["mrr"], temporal_breakdown["mrr"]),
+        ("Parse | hit", retrieval_breakdown["parse_given_hit"], temporal_breakdown["parse_given_hit"]),
+        (
+            "Correct | hit & parse",
+            retrieval_breakdown["correct_given_hit_parse"],
+            temporal_breakdown["correct_given_hit_parse"],
+        ),
+        ("Wrong window rate", retrieval_breakdown["wrong_window_rate"], temporal_breakdown["wrong_window_rate"]),
+        (
+            "Right window, unparsable",
+            retrieval_breakdown["right_unparsable_rate"],
+            temporal_breakdown["right_unparsable_rate"],
+        ),
+        (
+            "Right window, parsed wrong",
+            retrieval_breakdown["right_parsed_wrong_rate"],
+            temporal_breakdown["right_parsed_wrong_rate"],
+        ),
     ]:
-        breakdown_table.add_row(label, f"{value:.2f}")
+        breakdown_table.add_row(label, f"{retrieval_value:.2f}", f"{temporal_value:.2f}")
     console.print(breakdown_table)
 
 
@@ -554,6 +696,7 @@ def sweep_apollo(
     top_k_values: str = typer.Option("1,2,3,4", help="Comma-separated top-k values."),
     seed: int = typer.Option(7, help="Deterministic benchmark seed."),
     n_ctx: int = typer.Option(4096, min=1024, help="Inference context size."),
+    rerank_strategy: str = typer.Option("hybrid", help="Rerank strategy for temporal mode."),
 ) -> None:
     runner = GGUFRunner(model_path=model_path, n_ctx=n_ctx)
     top_ks = [int(value.strip()) for value in top_k_values.split(",") if value.strip()]
@@ -591,6 +734,7 @@ def sweep_apollo(
                 runner=runner,
                 recent_windows=recent_windows,
                 top_k=top_k,
+                rerank_strategy=rerank_strategy,
             )
             breakdown = summary["overall"]["retrieval_breakdown"]
             table.add_row(
@@ -604,6 +748,55 @@ def sweep_apollo(
                 f"{breakdown['top4_recall']:.2f}",
                 f"{summary['overall']['retrieval']['usage_accuracy_when_hit']:.2f}",
             )
+    console.print(table)
+
+
+@app.command("route-apollo")
+def route_apollo(
+    model_path: str = typer.Option(..., help="Path to the GGUF model."),
+    corpus_path: str = typer.Option("data/apollo11_clean.txt", help="Path to the Apollo corpus text file."),
+    case_count: int = typer.Option(6, min=3, help="Number of generated benchmark cases."),
+    windows: int = typer.Option(12, min=6, help="Number of windows per case."),
+    window_lines: int = typer.Option(24, min=8, help="Lines per window."),
+    recent_windows: int = typer.Option(2, min=0, help="Exact local context horizon in windows."),
+    seed: int = typer.Option(7, help="Deterministic benchmark seed."),
+    n_ctx: int = typer.Option(4096, min=1024, help="Inference context size."),
+) -> None:
+    runner = GGUFRunner(model_path=model_path, n_ctx=n_ctx)
+    cases = build_apollo_cases(
+        corpus_path=corpus_path,
+        case_count=case_count,
+        windows=windows,
+        window_lines=window_lines,
+        recent_windows=recent_windows,
+        seed=seed,
+    )
+    strategies = ["semantic", "temporal", "adjacency", "hybrid", "staged"]
+
+    table = Table(title="Apollo Routing Comparison")
+    table.add_column("Strategy")
+    table.add_column("Top-1")
+    table.add_column("Top-2")
+    table.add_column("Top-4")
+    table.add_column("MRR")
+
+    console.print("[bold]Apollo Routing Comparison[/bold]")
+    console.print(f"Backend: {runner.backend} ({runner.backend_reason})")
+
+    for strategy in strategies:
+        summary = evaluate_routing_only(
+            cases=cases,
+            runner=runner,
+            recent_windows=recent_windows,
+            strategy=strategy,
+        )
+        table.add_row(
+            strategy,
+            f"{summary['top1']:.2f}",
+            f"{summary['top2']:.2f}",
+            f"{summary['top4']:.2f}",
+            f"{summary['mrr']:.2f}",
+        )
     console.print(table)
 
 

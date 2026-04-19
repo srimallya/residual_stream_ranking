@@ -36,6 +36,7 @@ class SemanticCheckpointPayload:
     window_embedding: np.ndarray
     boundary_embedding: np.ndarray
     terms: frozenset[str]
+    anchors: frozenset[str]
 
 
 @dataclass(slots=True)
@@ -85,6 +86,18 @@ def extract_terms(text: str) -> frozenset[str]:
     return frozenset(tokens)
 
 
+def extract_anchors(text: str) -> frozenset[str]:
+    anchors = {
+        token.lower()
+        for token in re.findall(r"\b[a-zA-Z]+(?:-[a-zA-Z0-9]+)+\b", text)
+    }
+    anchors.update(
+        token.lower()
+        for token in re.findall(r"\b[a-zA-Z]{2,}\d{2,}[a-zA-Z0-9-]*\b", text)
+    )
+    return frozenset(anchors)
+
+
 def build_checkpoints(
     windows: Iterable[Window],
     embed_text: callable,
@@ -101,6 +114,7 @@ def build_checkpoints(
                     window_embedding=embed_text(window.text),
                     boundary_embedding=embed_text(window.boundary_text),
                     terms=extract_terms(window.text),
+                    anchors=extract_anchors(window.text),
                 ),
                 trace=provider.capture_boundary_residual(
                     boundary_token_index=window.index,
