@@ -508,7 +508,11 @@ class GemmaRuntime:
         log_event("generation worker started", request_id=request_id)
 
         input_ids = suffix_batch.input_ids.to(self.actual_device)
-        attention_mask = suffix_batch.attention_mask.to(self.actual_device)
+        attention_mask = torch.ones(
+            (1, session.token_count + prompt_tokens),
+            dtype=suffix_batch.attention_mask.dtype,
+            device=self.actual_device,
+        )
         current_cache = session.cache
         eos_ids = self.generation_config.eos_token_id
         if isinstance(eos_ids, int):
@@ -522,12 +526,13 @@ class GemmaRuntime:
 
         with self.lock, torch.inference_mode():
             for step in range(PRIMARY_MAX_NEW_TOKENS):
-                outputs = self.model(
+                model_inputs = self.model.prepare_inputs_for_generation(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     past_key_values=current_cache,
                     use_cache=True,
                 )
+                outputs = self.model(**model_inputs)
                 current_cache = outputs.past_key_values
                 next_token_id = self._sample_next_token(outputs.logits[:, -1, :])
                 generated_ids.append(next_token_id)
@@ -625,24 +630,35 @@ class GemmaRuntime:
         return DynamicCache(config=self.model.config if self.model is not None else None)
 
     def _sample_next_token(self, logits: torch.Tensor) -> int:
+        work = logits.detach().to(dtype=torch.float32, device="cpu").clone()
+        if work.ndim == 0:
+            return int(work.item())
+        if work.ndim > 2:
+            work = work.reshape(-1, work.shape[-1])[0]
+        elif work.ndim == 2:
+            work = work[0]
+        work = torch.nan_to_num(work, nan=float("-inf"), posinf=1e4, neginf=-1e4)
+
         if not self.generation_config:
-            return int(torch.argmax(logits, dim=-1).item())
+            return int(torch.argmax(work, dim=0).item())
 
         if not bool(self.generation_config.do_sample):
-            return int(torch.argmax(logits, dim=-1).item())
+            return int(torch.argmax(work, dim=0).item())
 
-        work = logits.clone()
         temperature = float(self.generation_config.temperature or 1.0)
         if temperature > 0 and temperature != 1.0:
             work = work / temperature
+            work = torch.nan_to_num(work, nan=float("-inf"), posinf=1e4, neginf=-1e4)
 
         top_k = int(self.generation_config.top_k or 0)
         if top_k > 0 and top_k < work.shape[-1]:
             values, _ = torch.topk(work, top_k)
             cutoff = values[..., -1, None]
             work = torch.where(work < cutoff, torch.full_like(work, float("-inf")), work)
+            work = torch.nan_to_num(work, nan=float("-inf"), posinf=1e4, neginf=-1e4)
 
         probs = torch.softmax(work, dim=-1)
+        probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
         top_p = float(self.generation_config.top_p or 1.0)
         if 0 < top_p < 1.0:
             sorted_probs, sorted_indices = torch.sort(probs, descending=True)
@@ -651,11 +667,16 @@ class GemmaRuntime:
             sorted_mask[..., 1:] = sorted_mask[..., :-1].clone()
             sorted_mask[..., 0] = False
             sorted_probs = sorted_probs.masked_fill(sorted_mask, 0)
-            sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)
+            denom = sorted_probs.sum()
+            if denom <= 0:
+                return int(torch.argmax(work, dim=0).item())
+            sorted_probs = sorted_probs / denom
+            sorted_probs = torch.nan_to_num(sorted_probs, nan=0.0, posinf=0.0, neginf=0.0)
             sampled_index = torch.multinomial(sorted_probs, num_samples=1)
-            token_id = sorted_indices.gather(-1, sampled_index)
-            return int(token_id.item())
+            return int(sorted_indices[sampled_index.item()].item())
 
+        if probs.sum() <= 0:
+            return int(torch.argmax(work, dim=0).item())
         return int(torch.multinomial(probs, num_samples=1).item())
 
     def _maybe_upgrade_session_cache(self, session: ChatSession) -> None:
@@ -694,7 +715,8 @@ class GemmaRuntime:
         session.cache_kind = kind
 
     def _format_history(self, turns: list[sqlite3.Row]) -> str:
-        chunks = [self._render_turn("system", SYSTEM_PROMPT)]
+        bos = self.tokenizer.bos_token if self.tokenizer and self.tokenizer.bos_token else "<bos>"
+        chunks = [bos, self._render_turn("system", SYSTEM_PROMPT)]
         for row in turns:
             role = row["role"]
             text = row["text"]

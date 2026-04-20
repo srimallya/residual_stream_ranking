@@ -90,8 +90,9 @@ function createHttpBridge(baseUrl = "http://127.0.0.1:4318") {
       const decoder = new TextDecoder();
       let buffer = "";
       let donePayload = null;
+      let streamComplete = false;
 
-      while (true) {
+      while (!streamComplete) {
         const { value, done } = await reader.read();
         if (done) {
           break;
@@ -117,6 +118,9 @@ function createHttpBridge(baseUrl = "http://127.0.0.1:4318") {
             handlers.onToken?.(payload);
           } else if (eventName === "done") {
             donePayload = payload;
+            streamComplete = true;
+            await reader.cancel();
+            break;
           } else if (eventName === "error") {
             throw new Error(payload.detail || payload.error || "stream_error");
           }
