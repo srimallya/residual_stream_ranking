@@ -16,6 +16,8 @@ const state = {
   bridgeMode: "loading",
   sidecarDevice: ""
 };
+let healthMonitorHandle = 0;
+const PLACEHOLDER_CONVERSATION_IDS = new Set(["offline", "loading", "restarting", "connecting"]);
 
 function setStatusBadge(status, detail = "") {
   const node = byId("app-status");
@@ -32,8 +34,30 @@ function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function normalizeMessageText(text) {
+  return String(text || "").replace(/\s+/g, " ").trim();
+}
+
+function findLastUserMessageIndex(messages, text) {
+  const normalized = normalizeMessageText(text);
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role === "user" && normalizeMessageText(message.text) === normalized) {
+      return index;
+    }
+  }
+  return -1;
+}
+
 function createHttpBridge(baseUrl = "http://127.0.0.1:4318") {
   return {
+    async healthState() {
+      return await fetchJson(`${baseUrl}/v1/health`);
+    },
     async bootstrapState() {
       const [health, graph] = await Promise.all([
         fetchJson(`${baseUrl}/v1/health`),
@@ -147,6 +171,9 @@ function createHttpBridge(baseUrl = "http://127.0.0.1:4318") {
 }
 
 function createUnavailableBridge() {
+  const fallbackConversationId = PLACEHOLDER_CONVERSATION_IDS.has(state.conversationId)
+    ? "demo-thread"
+    : state.conversationId || "demo-thread";
   return {
     async bootstrapState() {
       return {
@@ -156,7 +183,7 @@ function createUnavailableBridge() {
           orchestrationDevice: "cpu"
         },
         conversation: {
-          id: "offline",
+          id: fallbackConversationId,
           title: "offline",
           currentTokens: 0,
           maxTokens: 32768
@@ -551,7 +578,10 @@ function renderMessages(messages) {
 }
 
 function applyBootstrap(initial) {
-  state.conversationId = initial.conversation.id || "demo-thread";
+  const bootstrapConversationId = initial.conversation?.id || "";
+  state.conversationId = PLACEHOLDER_CONVERSATION_IDS.has(bootstrapConversationId)
+    ? state.conversationId || "demo-thread"
+    : bootstrapConversationId || state.conversationId || "demo-thread";
   state.bridgeMode = initial.sidecar?.status || "unknown";
   state.sidecarDevice = initial.sidecar?.preferredDevice || "";
   state.messages = initial.messages;
@@ -563,6 +593,64 @@ function applyBootstrap(initial) {
   setComposerDisabled(false);
   renderMessages(state.messages);
   drawGraph();
+}
+
+async function recoverAfterSendFailure(userText, sawStreamData) {
+  const deadline = Date.now() + 8000;
+  while (Date.now() < deadline) {
+    try {
+      const snapshot = await bridge.bootstrapState();
+      const lastUserIndex = findLastUserMessageIndex(snapshot.messages, userText);
+      if (lastUserIndex !== -1) {
+        const hasAssistantAfter = snapshot.messages
+          .slice(lastUserIndex + 1)
+          .some((message) => message.role === "assistant");
+        if (hasAssistantAfter || sawStreamData) {
+          return snapshot;
+        }
+      }
+    } catch (_error) {
+      // Sidecar is still unavailable; keep waiting.
+    }
+    await sleep(700);
+  }
+  return null;
+}
+
+async function syncSidecarStatus({ resync = false } = {}) {
+  try {
+    const health = await bridge.healthState();
+    const wasUnavailable = ["offline", "restarting", "connecting", "loading", "error"].includes(state.bridgeMode);
+    state.sidecarDevice = health.modelDevice || state.sidecarDevice;
+    state.bridgeMode = health.status || "ready";
+
+    if ((resync || wasUnavailable) && !state.sending && state.bootstrapReady) {
+      const snapshot = await bridge.bootstrapState();
+      applyBootstrap(snapshot);
+      return;
+    }
+    setStatusBadge(state.sending ? "busy" : state.bridgeMode, state.sidecarDevice);
+  } catch (_error) {
+    state.bridgeMode = state.sending ? "restarting" : "offline";
+    setStatusBadge(state.bridgeMode, "sidecar");
+  }
+}
+
+function startHealthMonitor() {
+  if (healthMonitorHandle) {
+    return;
+  }
+  healthMonitorHandle = window.setInterval(() => {
+    void syncSidecarStatus();
+  }, 3000);
+  window.addEventListener("focus", () => {
+    void syncSidecarStatus({ resync: true });
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) {
+      void syncSidecarStatus({ resync: true });
+    }
+  });
 }
 
 function bindComposer() {
@@ -618,9 +706,11 @@ function bindComposer() {
     input.style.height = "42px";
 
     let result;
+    let sawStreamData = false;
     try {
       result = await bridge.sendMessageStream(text, state.currentTokens, {
         onToken(payload) {
+          sawStreamData = sawStreamData || Boolean(payload.delta || payload.thinkingDelta);
           state.messages = state.messages.map((message) => {
             if (message.id !== pendingAssistant.id) {
               return message;
@@ -637,6 +727,13 @@ function bindComposer() {
         }
       });
     } catch (_error) {
+      setStatusBadge("restarting", "sidecar");
+      const recoveredSnapshot = await recoverAfterSendFailure(text, sawStreamData);
+      if (recoveredSnapshot) {
+        state.sending = false;
+        applyBootstrap(recoveredSnapshot);
+        return;
+      }
       state.messages = state.messages.map((message) => {
         if (message.id === pendingMessage.id) {
           return { ...message, pending: false, failed: true };
@@ -817,3 +914,4 @@ async function bootstrap() {
 bootstrap();
 bindComposer();
 bindGraphControls();
+startHealthMonitor();

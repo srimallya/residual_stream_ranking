@@ -1,0 +1,15 @@
+- generic [ref=e2]:
+  - banner [ref=e3]:
+    - heading "con-chat" [level=1] [ref=e4]
+    - status [ref=e5]: offline · mps
+  - main [ref=e6]:
+    - generic [ref=e9]:
+      - textbox "Message con-chat..." [ref=e10]
+      - button "Send" [ref=e11] [cursor=pointer]
+    - complementary [ref=e12]:
+      - generic [ref=e13]:
+        - generic [ref=e14]: Graph
+        - button "Reset conversation" [ref=e16] [cursor=pointer]: Reset
+      - generic [ref=e17]:
+        - img "Conversation memory graph" [ref=e18]
+        - status

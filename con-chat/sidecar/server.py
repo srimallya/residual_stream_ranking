@@ -918,7 +918,41 @@ class Store:
                 ),
             )
 
+    def _normalize_conversation_id(self, conversation_id: str | None) -> str:
+        candidate = str(conversation_id or "").strip()
+        if not candidate or candidate in {"offline", "loading", "restarting", "connecting"}:
+            return DEFAULT_CONVERSATION_ID
+        return candidate
+
+    def _ensure_conversation(self, conversation_id: str | None) -> str:
+        normalized_id = self._normalize_conversation_id(conversation_id)
+        with self.connect() as conn:
+            existing = conn.execute(
+                "select id from conversations where id = ?",
+                (normalized_id,),
+            ).fetchone()
+            if existing:
+                return normalized_id
+
+            created_at = now_iso()
+            conn.execute(
+                """
+                insert into conversations (id, title, current_tokens, max_tokens, created_at, updated_at)
+                values (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    normalized_id,
+                    "One continuous conversation",
+                    0,
+                    MAX_TOKENS,
+                    created_at,
+                    created_at,
+                ),
+            )
+        return normalized_id
+
     def conversation_snapshot(self, conversation_id: str) -> dict:
+        conversation_id = self._ensure_conversation(conversation_id)
         with self.connect() as conn:
             conversation = conn.execute(
                 "select * from conversations where id = ?",
@@ -1025,6 +1059,7 @@ class Store:
         on_text: callable | None = None,
         request_id: str | None = None,
     ) -> dict:
+        conversation_id = self._ensure_conversation(conversation_id)
         created_at = now_iso()
         unique = str(int(datetime.now().timestamp() * 1000))
         user_id = f"turn-{unique}-u"
@@ -1173,6 +1208,7 @@ class Store:
         return snapshot
 
     def reset_conversation(self, conversation_id: str) -> dict:
+        conversation_id = self._ensure_conversation(conversation_id)
         created_at = now_iso()
         log_event(f"reset conversation={conversation_id}")
         with self.connect() as conn:
