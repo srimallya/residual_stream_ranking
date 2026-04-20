@@ -13,8 +13,20 @@ const state = {
     y: 0
   },
   drag: null,
-  bridgeMode: "loading"
+  bridgeMode: "loading",
+  sidecarDevice: ""
 };
+
+function setStatusBadge(status, detail = "") {
+  const node = byId("app-status");
+  if (!node) {
+    return;
+  }
+  const normalized = status || "unknown";
+  const tone = normalized === "ready" ? "ready" : normalized === "offline" || normalized === "error" ? "offline" : "busy";
+  node.className = `app-status ${tone}`;
+  node.textContent = detail ? `${normalized} · ${detail}` : normalized;
+}
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
@@ -102,7 +114,7 @@ function createHttpBridge(baseUrl = "http://127.0.0.1:4318") {
           }
           const payload = JSON.parse(dataLines.join("\n") || "{}");
           if (eventName === "token") {
-            handlers.onToken?.(payload.delta || "");
+            handlers.onToken?.(payload);
           } else if (eventName === "done") {
             donePayload = payload;
           } else if (eventName === "error") {
@@ -493,7 +505,16 @@ function renderMessages(messages) {
       thinkingWrap.className = `thinking-wrap${message.collapsing ? " collapsing" : ""}`;
       const thinkingBubble = document.createElement("div");
       thinkingBubble.className = "thinking-bubble";
-      thinkingBubble.textContent = message.thinkingLabel || "thinking";
+      const thinkingMeta = document.createElement("div");
+      thinkingMeta.className = "thinking-meta";
+      thinkingMeta.textContent = message.thinkingLabel || "thinking";
+      thinkingBubble.appendChild(thinkingMeta);
+      if (message.thinkingText) {
+        const thinkingText = document.createElement("div");
+        thinkingText.className = "thinking-text";
+        thinkingText.textContent = message.thinkingText;
+        thinkingBubble.appendChild(thinkingText);
+      }
       thinkingWrap.appendChild(thinkingBubble);
       article.appendChild(role);
       article.appendChild(thinkingWrap);
@@ -527,10 +548,12 @@ function renderMessages(messages) {
 function applyBootstrap(initial) {
   state.conversationId = initial.conversation.id || "demo-thread";
   state.bridgeMode = initial.sidecar?.status || "unknown";
+  state.sidecarDevice = initial.sidecar?.preferredDevice || "";
   state.messages = initial.messages;
   state.graphNodes = initial.graph.nodes;
   state.graphEdges = initial.graph.edges;
   setBudget(initial.conversation.currentTokens, initial.conversation.maxTokens);
+  setStatusBadge(state.bridgeMode, state.sidecarDevice);
   state.bootstrapReady = true;
   setComposerDisabled(false);
   renderMessages(state.messages);
@@ -564,6 +587,7 @@ function bindComposer() {
     }
 
     state.sending = true;
+    setStatusBadge("busy", "generating");
     setComposerDisabled(true);
     const pendingMessage = {
       id: `pending-${Date.now()}`,
@@ -579,7 +603,8 @@ function bindComposer() {
       text: "",
       pending: true,
       thinking: true,
-      thinkingLabel: "thinking"
+      thinkingLabel: "thinking",
+      thinkingText: ""
     };
     state.messages = [...state.messages, pendingMessage, pendingAssistant];
     renderMessages(state.messages);
@@ -590,15 +615,16 @@ function bindComposer() {
     let result;
     try {
       result = await bridge.sendMessageStream(text, state.currentTokens, {
-        onToken(delta) {
+        onToken(payload) {
           state.messages = state.messages.map((message) => {
             if (message.id !== pendingAssistant.id) {
               return message;
             }
             return {
               ...message,
-              text: `${message.text || ""}${delta}`,
-              thinking: false,
+              text: `${message.text || ""}${payload.delta || ""}`,
+              thinking: Boolean(payload.thinkingActive),
+              thinkingText: `${message.thinkingText || ""}${payload.thinkingDelta || ""}`,
               pending: true
             };
           });
@@ -621,6 +647,7 @@ function bindComposer() {
         }
         return message;
       });
+      setStatusBadge("offline", "sidecar");
       renderMessages(state.messages);
       state.sending = false;
       setComposerDisabled(false);
@@ -639,6 +666,7 @@ function bindComposer() {
     setBudget(result.conversation.currentTokens, result.conversation.maxTokens);
     state.graphNodes = result.graph.nodes;
     state.graphEdges = result.graph.edges;
+    setStatusBadge(result.sidecar?.status || "ready", result.sidecar?.preferredDevice || state.sidecarDevice);
     renderMessages(state.messages);
     drawGraph();
     state.sending = false;
@@ -758,6 +786,7 @@ function bindGraphControls() {
     setBudget(result.conversation.currentTokens, result.conversation.maxTokens);
     state.graphNodes = result.graph.nodes;
     state.graphEdges = result.graph.edges;
+    setStatusBadge("ready", state.sidecarDevice);
     renderMessages(state.messages);
     drawGraph();
     hideTooltip();

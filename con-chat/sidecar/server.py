@@ -298,6 +298,14 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def log_event(message: str, *, request_id: str | None = None) -> None:
+    stamp = datetime.now().strftime("%H:%M:%S")
+    prefix = f"[con-chat {stamp}]"
+    if request_id:
+        prefix += f" [{request_id}]"
+    print(f"{prefix} {message}", flush=True)
+
+
 def token_estimate(text: str) -> int:
     return max(8, len(text) // 4)
 
@@ -353,6 +361,7 @@ class GemmaRuntime:
         start = time.perf_counter()
         try:
             device, dtype = self._resolve_device()
+            log_event(f"loading model={self.model_name} device={device} dtype={dtype}")
             tokenizer = AutoTokenizer.from_pretrained(self.model_name, local_files_only=True)
             model = AutoModelForCausalLM.from_pretrained(
                 self.model_name,
@@ -376,9 +385,13 @@ class GemmaRuntime:
             except Exception:
                 self.quantized_cache_supported = False
             self.ready = True
+            log_event(
+                f"model ready device={self.actual_device} quantized_cache_supported={self.quantized_cache_supported}"
+            )
         except Exception as exc:  # pragma: no cover - startup failure path
             self.ready = False
             self.error = repr(exc)
+            log_event(f"model load failed error={self.error}")
         finally:
             self.load_seconds = time.perf_counter() - start
 
@@ -391,7 +404,13 @@ class GemmaRuntime:
     def invalidate_session(self, conversation_id: str) -> None:
         self.sessions.pop(conversation_id, None)
 
-    def build_session_from_turns(self, conversation_id: str, turns: list[sqlite3.Row]) -> ChatSession:
+    def build_session_from_turns(
+        self,
+        conversation_id: str,
+        turns: list[sqlite3.Row],
+        *,
+        request_id: str | None = None,
+    ) -> ChatSession:
         if not self.ready or not self.model or not self.tokenizer:
             raise RuntimeError(f"model_not_ready:{self.error}")
 
@@ -399,6 +418,10 @@ class GemmaRuntime:
         encoded = self.tokenizer(transcript, return_tensors="pt", return_attention_mask=True)
         cache_kind = self._preferred_cache_kind(int(encoded.input_ids.shape[-1]))
         cache = self._new_cache(cache_kind)
+        log_event(
+            f"build session conversation={conversation_id} prompt_tokens={int(encoded.input_ids.shape[-1])} cache={cache_kind}",
+            request_id=request_id,
+        )
 
         with self.lock, torch.inference_mode():
             try:
@@ -436,6 +459,7 @@ class GemmaRuntime:
         turns: list[sqlite3.Row],
         user_text: str,
         on_text: callable | None = None,
+        request_id: str | None = None,
     ) -> tuple[str, dict[str, object]]:
         if not self.ready or not self.model or not self.tokenizer or not self.generation_config:
             raise RuntimeError(f"model_not_ready:{self.error}")
@@ -458,7 +482,12 @@ class GemmaRuntime:
         session = self.sessions.get(conversation_id)
         last_turn_id = turns[-1]["id"] if turns else None
         if session is None or session.last_turn_id != last_turn_id:
-            session = self.build_session_from_turns(conversation_id, turns)
+            session = self.build_session_from_turns(conversation_id, turns, request_id=request_id)
+        else:
+            log_event(
+                f"reuse session conversation={conversation_id} cached_tokens={session.token_count} cache={session.cache_kind}",
+                request_id=request_id,
+            )
 
         suffix = self._format_user_suffix(user_text)
         prompt_start = time.perf_counter()
@@ -470,6 +499,10 @@ class GemmaRuntime:
         )
         prompt_seconds = time.perf_counter() - prompt_start
         prompt_tokens = int(suffix_batch.input_ids.shape[-1])
+        log_event(
+            f"stream reply start suffix_tokens={prompt_tokens} user_chars={len(user_text)}",
+            request_id=request_id,
+        )
 
         streamer = TextIteratorStreamer(
             self.tokenizer,
@@ -507,22 +540,42 @@ class GemmaRuntime:
         generation_start = time.perf_counter()
         worker = threading.Thread(target=_generate, daemon=True)
         worker.start()
+        log_event("generation worker started", request_id=request_id)
 
         raw_generated = ""
         visible_generated = ""
+        thinking_generated = ""
+        first_event_logged = False
         for chunk in streamer:
             raw_generated += chunk
-            _, current_visible = self._parse_response(raw_generated)
+            current_thinking, current_visible = self._parse_response(raw_generated)
+            thinking_delta = (
+                current_thinking[len(thinking_generated):]
+                if current_thinking.startswith(thinking_generated)
+                else current_thinking
+            )
             if current_visible.startswith(visible_generated):
                 delta = current_visible[len(visible_generated) :]
             else:
                 delta = current_visible
-            if delta and on_text is not None:
-                on_text(delta)
+            if (delta or thinking_delta) and on_text is not None:
+                on_text({
+                    "delta": delta,
+                    "thinkingDelta": thinking_delta,
+                    "thinkingActive": bool(current_thinking),
+                })
+            if not first_event_logged and (delta or thinking_delta):
+                log_event(
+                    f"first stream event content_chars={len(delta)} thinking_chars={len(thinking_delta)}",
+                    request_id=request_id,
+                )
+                first_event_logged = True
             visible_generated = current_visible
+            thinking_generated = current_thinking
 
         worker.join()
         if generation_error:
+            log_event(f"generation failed error={generation_error[0]!r}", request_id=request_id)
             raise generation_error[0]
 
         outputs = generation_holder["outputs"]
@@ -537,6 +590,10 @@ class GemmaRuntime:
         self._maybe_upgrade_session_cache(session)
 
         thinking_text, assistant_text = self._parse_response(raw_generated)
+        log_event(
+            f"stream reply done completion_tokens={len(generated_ids)} thinking_chars={len(thinking_text)} answer_chars={len(assistant_text)} total_seconds={generation_seconds:.2f}",
+            request_id=request_id,
+        )
         return assistant_text, {
             "promptAssemblySeconds": round(prompt_seconds, 4),
             "generationSeconds": round(generation_seconds, 4),
@@ -840,6 +897,11 @@ class Store:
 
         nodes, derived_edges = self._graph_nodes(visible_turns, memory)
         return {
+            "sidecar": {
+                "status": "ready" if self.runtime.ready else "error",
+                "preferredDevice": self.runtime.actual_device,
+                "orchestrationDevice": ORCHESTRATION_DEVICE,
+            },
             "conversation": {
                 "id": conversation["id"],
                 "title": conversation["title"],
@@ -865,6 +927,7 @@ class Store:
         conversation_id: str,
         user_text: str,
         on_text: callable | None = None,
+        request_id: str | None = None,
     ) -> dict:
         created_at = now_iso()
         unique = str(int(datetime.now().timestamp() * 1000))
@@ -878,11 +941,16 @@ class Store:
                 (conversation_id,),
             ).fetchall()
         prompt_turns = self._prompt_turns(prior_turns)
+        log_event(
+            f"round start conversation={conversation_id} prior_turns={len(prompt_turns)} user_tokens={user_tokens}",
+            request_id=request_id,
+        )
         assistant_text, timings = self.runtime.stream_reply(
             conversation_id=conversation_id,
             turns=prompt_turns,
             user_text=user_text,
             on_text=on_text,
+            request_id=request_id,
         )
         assistant_tokens = max(self.runtime.count_tokens(assistant_text), timings["completionTokens"])
 
@@ -994,6 +1062,10 @@ class Store:
             )
         persistence_seconds = time.perf_counter() - persistence_start
         self.runtime.finalize_session_turn(conversation_id=conversation_id, assistant_turn_id=assistant_id)
+        log_event(
+            f"round persisted assistant_tokens={assistant_tokens} persistence_seconds={persistence_seconds:.3f}",
+            request_id=request_id,
+        )
 
         snapshot = self.conversation_snapshot(conversation_id)
         snapshot["assistantText"] = assistant_text
@@ -1006,6 +1078,7 @@ class Store:
 
     def reset_conversation(self, conversation_id: str) -> dict:
         created_at = now_iso()
+        log_event(f"reset conversation={conversation_id}")
         with self.connect() as conn:
             conn.execute("delete from turns where conversation_id = ?", (conversation_id,))
             conn.execute("delete from memory_objects where conversation_id = ?", (conversation_id,))
@@ -1179,9 +1252,11 @@ class Handler(BaseHTTPRequestHandler):
             payload = self._read_json()
             conversation_id = payload.get("conversationId", DEFAULT_CONVERSATION_ID)
             user_text = str(payload.get("userText", "")).strip()
+            request_id = f"req-{int(time.time() * 1000)}"
             if not user_text:
                 self._send_json(400, {"error": "empty_message"})
                 return
+            log_event(f"http stream request conversation={conversation_id} chars={len(user_text)}", request_id=request_id)
             self.send_response(200)
             self.send_header("content-type", "text/event-stream")
             self.send_header("cache-control", "no-cache")
@@ -1191,10 +1266,12 @@ class Handler(BaseHTTPRequestHandler):
                 snapshot = STORE.stream_turns(
                     conversation_id,
                     user_text,
-                    on_text=lambda delta: self._send_sse("token", {"delta": delta}),
+                    on_text=lambda payload: self._send_sse("token", payload),
+                    request_id=request_id,
                 )
                 self._send_sse("done", snapshot)
             except Exception as exc:  # pragma: no cover - runtime failure path
+                log_event(f"http stream error error={exc!r}", request_id=request_id)
                 self._send_sse("error", {"error": "generation_failed", "detail": repr(exc)})
             return
 
