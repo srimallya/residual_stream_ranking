@@ -8,7 +8,6 @@ import sqlite3
 import sys
 import threading
 import time
-from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -16,7 +15,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig, TextIteratorStreamer
+from transformers.cache_utils import DynamicCache, QuantizedCache
 
 
 PORT = int(os.environ.get("CON_CHAT_PORT", "4318"))
@@ -28,6 +28,9 @@ DEFAULT_CONVERSATION_ID = "demo-thread"
 MAX_TOKENS = 32768
 PRIMARY_MAX_NEW_TOKENS = 512
 FALLBACK_MAX_NEW_TOKENS = 384
+KV_QUANTIZE_AFTER_TOKENS = int(os.environ.get("CON_CHAT_KV_QUANTIZE_AFTER_TOKENS", "4096"))
+KV_QUANTIZE_BITS = int(os.environ.get("CON_CHAT_KV_QUANTIZE_BITS", "4"))
+KV_QUANTIZE_RESIDUAL_LENGTH = int(os.environ.get("CON_CHAT_KV_QUANTIZE_RESIDUAL_LENGTH", "128"))
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ENTITY_STOPWORDS = {
     "about", "after", "again", "also", "and", "answer", "are", "assist", "based", "because",
@@ -309,6 +312,20 @@ class GraphNode:
     detail: str | None = None
 
 
+@dataclass
+class ChatSession:
+    conversation_id: str
+    transcript: str
+    token_ids: list[int]
+    cache: object
+    cache_kind: str
+    last_turn_id: str | None
+
+    @property
+    def token_count(self) -> int:
+        return len(self.token_ids)
+
+
 class GemmaRuntime:
     def __init__(self, model_name: str, preferred_device: str) -> None:
         self.model_name = resolve_model_path(model_name)
@@ -317,11 +334,14 @@ class GemmaRuntime:
         self.dtype = torch.float32
         self.tokenizer = None
         self.model = None
+        self.generation_config = None
         self.response_pattern: re.Pattern[str] | None = None
         self.lock = threading.Lock()
+        self.sessions: dict[str, ChatSession] = {}
         self.load_seconds = 0.0
         self.ready = False
         self.error = None
+        self.quantized_cache_supported = False
         self._load()
 
     def _resolve_device(self) -> tuple[str, torch.dtype]:
@@ -337,15 +357,24 @@ class GemmaRuntime:
             model = AutoModelForCausalLM.from_pretrained(
                 self.model_name,
                 local_files_only=True,
-                torch_dtype=dtype,
+                dtype=dtype,
             )
             model.to(device)
             model.eval()
             self.actual_device = device
             self.dtype = dtype
             self.tokenizer = tokenizer
+            self.generation_config = GenerationConfig.from_pretrained(
+                self.model_name,
+                local_files_only=True,
+            )
             self.response_pattern = self._load_response_pattern()
             self.model = model
+            try:
+                import optimum.quanto  # noqa: F401
+                self.quantized_cache_supported = True
+            except Exception:
+                self.quantized_cache_supported = False
             self.ready = True
         except Exception as exc:  # pragma: no cover - startup failure path
             self.ready = False
@@ -359,13 +388,62 @@ class GemmaRuntime:
         tokens = self.tokenizer(text, add_special_tokens=False, return_attention_mask=False)
         return len(tokens["input_ids"])
 
-    def generate_reply(self, turns: list[sqlite3.Row]) -> tuple[str, dict]:
+    def invalidate_session(self, conversation_id: str) -> None:
+        self.sessions.pop(conversation_id, None)
+
+    def build_session_from_turns(self, conversation_id: str, turns: list[sqlite3.Row]) -> ChatSession:
         if not self.ready or not self.model or not self.tokenizer:
             raise RuntimeError(f"model_not_ready:{self.error}")
 
-        user_text = turns[-1]["text"] if turns else ""
+        transcript = self._format_history(turns)
+        encoded = self.tokenizer(transcript, return_tensors="pt", return_attention_mask=True)
+        cache_kind = self._preferred_cache_kind(int(encoded.input_ids.shape[-1]))
+        cache = self._new_cache(cache_kind)
+
+        with self.lock, torch.inference_mode():
+            try:
+                outputs = self.model(
+                    input_ids=encoded.input_ids.to(self.actual_device),
+                    attention_mask=encoded.attention_mask.to(self.actual_device),
+                    use_cache=True,
+                    past_key_values=cache,
+                )
+            except Exception:
+                self.quantized_cache_supported = False
+                cache_kind = "dynamic"
+                outputs = self.model(
+                    input_ids=encoded.input_ids.to(self.actual_device),
+                    attention_mask=encoded.attention_mask.to(self.actual_device),
+                    use_cache=True,
+                    past_key_values=DynamicCache(config=self.model.config),
+                )
+
+        session = ChatSession(
+            conversation_id=conversation_id,
+            transcript=transcript,
+            token_ids=encoded.input_ids[0].tolist(),
+            cache=outputs.past_key_values,
+            cache_kind=cache_kind,
+            last_turn_id=turns[-1]["id"] if turns else None,
+        )
+        self.sessions[conversation_id] = session
+        return session
+
+    def stream_reply(
+        self,
+        *,
+        conversation_id: str,
+        turns: list[sqlite3.Row],
+        user_text: str,
+        on_text: callable | None = None,
+    ) -> tuple[str, dict[str, object]]:
+        if not self.ready or not self.model or not self.tokenizer or not self.generation_config:
+            raise RuntimeError(f"model_not_ready:{self.error}")
+
         identity_override = self._identity_override(user_text)
         if identity_override is not None:
+            if on_text is not None:
+                on_text(identity_override)
             return identity_override, {
                 "promptAssemblySeconds": 0.0,
                 "generationSeconds": 0.0,
@@ -373,123 +451,179 @@ class GemmaRuntime:
                 "promptTokens": 0,
                 "completionTokens": self.count_tokens(identity_override),
                 "modelDevice": self.actual_device,
+                "cacheKind": "none",
+                "thinking": "",
             }
 
+        session = self.sessions.get(conversation_id)
+        last_turn_id = turns[-1]["id"] if turns else None
+        if session is None or session.last_turn_id != last_turn_id:
+            session = self.build_session_from_turns(conversation_id, turns)
+
+        suffix = self._format_user_suffix(user_text)
         prompt_start = time.perf_counter()
-        prompt = self._format_prompt(turns)
-        prompt_batch = self.tokenizer(prompt, return_tensors="pt", return_attention_mask=True)
-        model_inputs = prompt_batch.input_ids
-        attention_mask = prompt_batch.attention_mask
+        suffix_batch = self.tokenizer(
+            suffix,
+            add_special_tokens=False,
+            return_tensors="pt",
+            return_attention_mask=True,
+        )
         prompt_seconds = time.perf_counter() - prompt_start
+        prompt_tokens = int(suffix_batch.input_ids.shape[-1])
+
+        streamer = TextIteratorStreamer(
+            self.tokenizer,
+            skip_prompt=True,
+            skip_special_tokens=False,
+        )
+        generation_kwargs = {
+            "input_ids": suffix_batch.input_ids.to(self.actual_device),
+            "attention_mask": suffix_batch.attention_mask.to(self.actual_device),
+            "past_key_values": session.cache,
+            "use_cache": True,
+            "max_new_tokens": PRIMARY_MAX_NEW_TOKENS,
+            "do_sample": bool(self.generation_config.do_sample),
+            "temperature": float(self.generation_config.temperature),
+            "top_p": float(self.generation_config.top_p),
+            "top_k": int(self.generation_config.top_k),
+            "pad_token_id": int(self.generation_config.pad_token_id),
+            "eos_token_id": self.generation_config.eos_token_id,
+            "return_dict_in_generate": True,
+            "streamer": streamer,
+        }
+
+        generation_holder: dict[str, object] = {}
+        generation_error: list[BaseException] = []
+
+        def _generate() -> None:
+            try:
+                with self.lock, torch.inference_mode():
+                    generation_holder["outputs"] = self.model.generate(**generation_kwargs)
+            except BaseException as exc:  # pragma: no cover - background thread failure path
+                generation_error.append(exc)
+            finally:
+                generation_holder["finished_at"] = time.perf_counter()
 
         generation_start = time.perf_counter()
-        with self.lock, torch.inference_mode():
-            inputs = model_inputs.to(self.actual_device)
-            attn = attention_mask.to(self.actual_device)
-            outputs = self.model.generate(
-                inputs,
-                attention_mask=attn,
-                max_new_tokens=PRIMARY_MAX_NEW_TOKENS,
-                do_sample=True,
-                temperature=1.0,
-                top_p=0.95,
-                top_k=64,
-                repetition_penalty=1.1,
-                pad_token_id=self.tokenizer.eos_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-            )
-        generation_seconds = time.perf_counter() - generation_start
+        worker = threading.Thread(target=_generate, daemon=True)
+        worker.start()
 
-        prompt_tokens = int(model_inputs.shape[-1])
-        generated_ids = outputs[0, prompt_tokens:]
-        decoded = self.tokenizer.decode(generated_ids, skip_special_tokens=False)
-        thinking_text, assistant_text = self._parse_response(decoded)
-        completion_tokens = int(generated_ids.shape[-1])
+        raw_generated = ""
+        visible_generated = ""
+        for chunk in streamer:
+            raw_generated += chunk
+            _, current_visible = self._parse_response(raw_generated)
+            if current_visible.startswith(visible_generated):
+                delta = current_visible[len(visible_generated) :]
+            else:
+                delta = current_visible
+            if delta and on_text is not None:
+                on_text(delta)
+            visible_generated = current_visible
 
-        if self._needs_retry(assistant_text):
-            retry_start = time.perf_counter()
-            with self.lock, torch.inference_mode():
-                retry_outputs = self.model.generate(
-                    inputs,
-                    attention_mask=attn,
-                    max_new_tokens=PRIMARY_MAX_NEW_TOKENS,
-                    do_sample=True,
-                    temperature=1.0,
-                    top_p=0.95,
-                    top_k=64,
-                    repetition_penalty=1.1,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                )
-            generation_seconds += time.perf_counter() - retry_start
-            generated_ids = retry_outputs[0, prompt_tokens:]
-            decoded = self.tokenizer.decode(generated_ids, skip_special_tokens=False)
-            thinking_text, assistant_text = self._parse_response(decoded)
-            completion_tokens = int(generated_ids.shape[-1])
+        worker.join()
+        if generation_error:
+            raise generation_error[0]
 
-        if self._looks_truncated(assistant_text, completion_tokens, PRIMARY_MAX_NEW_TOKENS):
-            assistant_text, completion_tokens, continuation_seconds = self._continue_response(
-                user_text=turns[-1]["text"],
-                partial_answer=assistant_text,
-            )
-            generation_seconds += continuation_seconds
+        outputs = generation_holder["outputs"]
+        generation_seconds = float(generation_holder["finished_at"] - generation_start)
+        generated_ids = outputs.sequences[0, prompt_tokens:].detach().cpu().tolist()
 
-        if self._needs_retry(assistant_text):
-            assistant_text = self._safe_fallback_reply(turns[-1]["text"] if turns else "")
-            thinking_text = ""
-            completion_tokens = self.count_tokens(assistant_text)
+        session.cache = outputs.past_key_values
+        session.transcript += suffix + raw_generated
+        session.token_ids.extend(suffix_batch.input_ids[0].tolist())
+        session.token_ids.extend(generated_ids)
+        session.last_turn_id = None
+        self._maybe_upgrade_session_cache(session)
 
+        thinking_text, assistant_text = self._parse_response(raw_generated)
         return assistant_text, {
             "promptAssemblySeconds": round(prompt_seconds, 4),
             "generationSeconds": round(generation_seconds, 4),
             "totalModelSeconds": round(prompt_seconds + generation_seconds, 4),
             "promptTokens": prompt_tokens,
-            "completionTokens": completion_tokens,
+            "completionTokens": len(generated_ids),
             "modelDevice": self.actual_device,
+            "cacheKind": session.cache_kind,
             "thinking": thinking_text,
         }
 
-    def _format_prompt(self, turns: list[sqlite3.Row]) -> str:
-        chunks: list[str] = [
-            "<|turn>system\n",
-            SYSTEM_PROMPT,
-            "<turn|>",
-        ]
+    def finalize_session_turn(self, *, conversation_id: str, assistant_turn_id: str) -> None:
+        session = self.sessions.get(conversation_id)
+        if session is not None:
+            session.last_turn_id = assistant_turn_id
+
+    def _preferred_cache_kind(self, token_count: int) -> str:
+        if self.quantized_cache_supported and token_count >= KV_QUANTIZE_AFTER_TOKENS:
+            return "quantized"
+        return "dynamic"
+
+    def _new_cache(self, kind: str) -> object:
+        if kind == "quantized" and self.quantized_cache_supported and self.model is not None:
+            try:
+                return QuantizedCache(
+                    backend="quanto",
+                    config=self.model.config,
+                    nbits=KV_QUANTIZE_BITS,
+                    residual_length=KV_QUANTIZE_RESIDUAL_LENGTH,
+                )
+            except Exception:
+                self.quantized_cache_supported = False
+        return DynamicCache(config=self.model.config if self.model is not None else None)
+
+    def _maybe_upgrade_session_cache(self, session: ChatSession) -> None:
+        if session.cache_kind == "quantized":
+            return
+        if not self.quantized_cache_supported:
+            return
+        if session.token_count < KV_QUANTIZE_AFTER_TOKENS:
+            return
+        self._rebuild_session_cache(session, "quantized")
+
+    def _rebuild_session_cache(self, session: ChatSession, kind: str) -> None:
+        if not self.model:
+            return
+        full_ids = torch.tensor([session.token_ids], dtype=torch.long, device=self.actual_device)
+        attention_mask = torch.ones_like(full_ids)
+        cache = self._new_cache(kind)
+        with self.lock, torch.inference_mode():
+            try:
+                outputs = self.model(
+                    input_ids=full_ids,
+                    attention_mask=attention_mask,
+                    use_cache=True,
+                    past_key_values=cache,
+                )
+            except Exception:
+                self.quantized_cache_supported = False
+                outputs = self.model(
+                    input_ids=full_ids,
+                    attention_mask=attention_mask,
+                    use_cache=True,
+                    past_key_values=DynamicCache(config=self.model.config),
+                )
+                kind = "dynamic"
+        session.cache = outputs.past_key_values
+        session.cache_kind = kind
+
+    def _format_history(self, turns: list[sqlite3.Row]) -> str:
+        chunks = [self._render_turn("system", SYSTEM_PROMPT)]
         for row in turns:
             role = row["role"]
             text = row["text"]
-            if role == "system":
-                continue
-            if self._is_preview_artifact(text):
+            if role == "system" or self._is_preview_artifact(text):
                 continue
             if role == "user":
-                chunks.extend(["<|turn>user\n", text, "<turn|>"])
+                chunks.append(self._render_turn("user", text))
             elif role == "assistant":
-                chunks.extend(["<|turn>model\n", text, "<turn|>"])
-        chunks.append("<|turn>model\n")
-        return "\n".join(chunks)
+                chunks.append(self._render_turn("model", text))
+        return "".join(chunks)
 
-    def _format_fallback_prompt(self, user_text: str, partial_answer: str = "") -> str:
-        return "\n".join(
-            [
-                "<|turn>system\n",
-                SYSTEM_PROMPT,
-                "Continue the assistant answer cleanly from the partial draft.",
-                "Do not mention Google or a model vendor unless asked directly.",
-                "Do not restart from the beginning unless necessary.",
-                "Finish the answer naturally.",
-                "Do not add meta commentary about the answer.",
-                "Return the final answer only.",
-                "<turn|>",
-                "<|turn>user\n",
-                user_text,
-                "<turn|>",
-                "<|turn>model\n",
-                partial_answer,
-                "<turn|>",
-                "<|turn>model\n",
-            ]
-        )
+    def _format_user_suffix(self, user_text: str) -> str:
+        return self._render_turn("user", user_text) + "<|turn>model\n"
+
+    def _render_turn(self, role: str, text: str) -> str:
+        return f"<|turn>{role}\n{text}<turn|>\n"
 
     def _load_response_pattern(self) -> re.Pattern[str] | None:
         if not self.tokenizer:
@@ -514,67 +648,6 @@ class GemmaRuntime:
         answer = self._clean_response(content)
         return thinking, answer
 
-    def _continue_response(self, user_text: str, partial_answer: str) -> tuple[str, int, float]:
-        answer = partial_answer.strip()
-        total_seconds = 0.0
-        total_completion_tokens = self.count_tokens(answer)
-
-        for _ in range(2):
-            if not self._looks_truncated(answer, total_completion_tokens, FALLBACK_MAX_NEW_TOKENS):
-                break
-
-            fallback_prompt = self._format_fallback_prompt(user_text, answer)
-            fallback_batch = self.tokenizer(fallback_prompt, return_tensors="pt", return_attention_mask=True)
-            fallback_inputs = fallback_batch.input_ids
-            fallback_attention_mask = fallback_batch.attention_mask
-
-            retry_start = time.perf_counter()
-            with self.lock, torch.inference_mode():
-                fallback_outputs = self.model.generate(
-                    fallback_inputs.to(self.actual_device),
-                    attention_mask=fallback_attention_mask.to(self.actual_device),
-                    max_new_tokens=FALLBACK_MAX_NEW_TOKENS,
-                    do_sample=False,
-                    repetition_penalty=1.08,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                )
-            total_seconds += time.perf_counter() - retry_start
-
-            fallback_prompt_tokens = int(fallback_inputs.shape[-1])
-            generated_ids = fallback_outputs[0, fallback_prompt_tokens:]
-            decoded = self.tokenizer.decode(generated_ids, skip_special_tokens=False)
-            _, continued_answer = self._parse_response(decoded)
-            if not continued_answer:
-                break
-
-            answer = self._merge_continuation(answer, continued_answer)
-            total_completion_tokens = self.count_tokens(answer)
-
-        return answer, total_completion_tokens, total_seconds
-
-    def _merge_continuation(self, base: str, continuation: str) -> str:
-        if not base:
-            return continuation
-        if not continuation:
-            return base
-        if continuation in base:
-            return base
-
-        max_overlap = min(len(base), len(continuation), 240)
-        overlap = 0
-        for size in range(max_overlap, 24, -1):
-            if base[-size:] == continuation[:size]:
-                overlap = size
-                break
-
-        if overlap:
-            merged = base + continuation[overlap:]
-        else:
-            merged = f"{base.rstrip()} {continuation.lstrip()}"
-
-        return re.sub(r"\n{3,}", "\n\n", merged).strip()
-
     def _clean_response(self, text: str) -> str:
         cleaned = text.strip()
         cleaned = re.sub(r"<\|turn\>|<turn\|>", "", cleaned, flags=re.IGNORECASE)
@@ -590,17 +663,9 @@ class GemmaRuntime:
             cleaned = cleaned.split("User:", 1)[0].strip()
         if "System:" in cleaned:
             cleaned = cleaned.split("System:", 1)[0].strip()
-        if "\nthought\n" in cleaned.lower():
-            cleaned = cleaned.split("\n", 1)[-1].strip()
-        if "Model needs to continue" in cleaned:
-            cleaned = cleaned.split("Model needs to continue", 1)[0].strip()
         while cleaned.startswith("Assistant:"):
             cleaned = cleaned[len("Assistant:") :].strip()
         cleaned = cleaned.replace("\nAssistant:", "\n").strip()
-        answer_match = re.search(r"\bANSWER\b\s*:?\s*(.+)$", cleaned, flags=re.IGNORECASE | re.DOTALL)
-        if answer_match:
-            cleaned = answer_match.group(1).strip()
-        cleaned = re.sub(r"^\s*why\s+.+?\?\s*", "", cleaned, count=1, flags=re.IGNORECASE)
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
         return cleaned
 
@@ -608,75 +673,8 @@ class GemmaRuntime:
         return text.startswith("Browser preview mode is active")
 
     def _is_degenerate_response(self, text: str) -> bool:
-        normalized = " ".join(text.strip().split())
-        if not normalized:
-            return True
-        lowered = normalized.lower()
-        if "<end" in lowered or "<start" in lowered:
-            return True
-        if re.search(r"mid[_-]of[_-]turn", lowered):
-            return True
-        if "model needs to continue" in lowered:
-            return True
-        if lowered.startswith("thought ") or lowered.startswith("thought\n"):
-            return True
-        if "thinking process" in lowered or "model response" in lowered:
-            return True
-        if "boundaries" in lowered and "relations" in lowered:
-            return True
-        if "analyze the request" in lowered or "self-correction" in lowered:
-            return True
-        if "identify key boundaries" in lowered or "symbol creation" in lowered:
-            return True
-        if "possible interpretations" in lowered:
-            return True
-        if "developed by **google**" in lowered or "developed by google" in lowered:
-            return True
-        repeated_token = re.fullmatch(r"(\b\w+\b)(?:\s+\1){10,}", normalized, flags=re.IGNORECASE)
-        if repeated_token:
-            return True
-        if re.search(r"\b([A-Za-z])(?:\s+\1){8,}\b", normalized):
-            return True
-        tokens = re.findall(r"[A-Za-z0-9']+", normalized.lower())
-        if len(tokens) >= 12:
-            counts = Counter(tokens)
-            token, frequency = counts.most_common(1)[0]
-            if len(token) <= 3 and (frequency / len(tokens)) >= 0.45:
-                return True
-            if len(set(tokens[-12:])) <= 2:
-                return True
-            if len(set(tokens)) <= 3 and len(tokens) >= 18:
-                return True
-        if normalized.endswith("..."):
-            return True
-        return False
-
-    def _needs_retry(self, text: str) -> bool:
-        normalized = " ".join(text.strip().split())
-        if not normalized:
-            return True
-        lowered = normalized.lower()
-        if "<turn|>" in normalized or "<|turn>" in normalized or "<channel|>" in normalized or "<|channel>" in normalized:
-            return True
-        if lowered.startswith("i hit a bad completion on that turn"):
-            return True
-        return False
-
-    def _looks_truncated(self, text: str, completion_tokens: int, budget: int) -> bool:
-        normalized = " ".join(text.strip().split())
-        if not normalized:
-            return False
-        if completion_tokens >= (budget - 6):
-            return True
-        if re.search(r"\*\*[^*]*$", normalized):
-            return True
-        if re.search(r"(?:^|\s)\d+\.\s+\*{0,2}[A-Za-z][A-Za-z\s-]{0,24}$", normalized):
-            return True
-        if re.search(r"[:;,]\s*$", normalized):
-            return True
-        if len(normalized) > 120 and not re.search(r"[.!?][\"')\]]?\s*$", normalized):
-            return True
-        return False
+        normalized = " ".join(text.strip().split()).lower()
+        return not normalized or normalized.startswith("i hit a bad completion on that turn")
 
     def _identity_override(self, user_text: str) -> str | None:
         normalized = " ".join(user_text.lower().split())
@@ -860,6 +858,14 @@ class Store:
         }
 
     def append_turns(self, conversation_id: str, user_text: str) -> dict:
+        return self.stream_turns(conversation_id, user_text)
+
+    def stream_turns(
+        self,
+        conversation_id: str,
+        user_text: str,
+        on_text: callable | None = None,
+    ) -> dict:
         created_at = now_iso()
         unique = str(int(datetime.now().timestamp() * 1000))
         user_id = f"turn-{unique}-u"
@@ -871,12 +877,13 @@ class Store:
                 "select * from turns where conversation_id = ? order by created_at asc",
                 (conversation_id,),
             ).fetchall()
-        synthetic_user_row = {
-            "id": user_id,
-            "role": "user",
-            "text": user_text,
-        }
-        assistant_text, timings = self.runtime.generate_reply([*self._prompt_turns(prior_turns), synthetic_user_row])
+        prompt_turns = self._prompt_turns(prior_turns)
+        assistant_text, timings = self.runtime.stream_reply(
+            conversation_id=conversation_id,
+            turns=prompt_turns,
+            user_text=user_text,
+            on_text=on_text,
+        )
         assistant_tokens = max(self.runtime.count_tokens(assistant_text), timings["completionTokens"])
 
         persistence_start = time.perf_counter()
@@ -986,6 +993,7 @@ class Store:
                 ),
             )
         persistence_seconds = time.perf_counter() - persistence_start
+        self.runtime.finalize_session_turn(conversation_id=conversation_id, assistant_turn_id=assistant_id)
 
         snapshot = self.conversation_snapshot(conversation_id)
         snapshot["assistantText"] = assistant_text
@@ -1011,6 +1019,7 @@ class Store:
                 """,
                 (created_at, conversation_id),
             )
+        self.runtime.invalidate_session(conversation_id)
         return self.conversation_snapshot(conversation_id)
 
     def _is_visible_chat_turn(self, row: sqlite3.Row) -> bool:
@@ -1024,7 +1033,16 @@ class Store:
 
     def _prompt_turns(self, rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
         visible = self._stable_visible_turns(rows)
-        return visible[-12:]
+        selected: list[sqlite3.Row] = []
+        running_tokens = 0
+        budget = max(1024, MAX_TOKENS - PRIMARY_MAX_NEW_TOKENS - 512)
+        for row in reversed(visible):
+            token_count = int(row["token_count"])
+            if selected and (running_tokens + token_count) > budget:
+                break
+            selected.append(row)
+            running_tokens += token_count
+        return list(reversed(selected))
 
     def _stable_visible_turns(self, rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
         stable: list[sqlite3.Row] = []
@@ -1157,6 +1175,29 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        if parsed.path == "/v1/chat/stream":
+            payload = self._read_json()
+            conversation_id = payload.get("conversationId", DEFAULT_CONVERSATION_ID)
+            user_text = str(payload.get("userText", "")).strip()
+            if not user_text:
+                self._send_json(400, {"error": "empty_message"})
+                return
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("cache-control", "no-cache")
+            self.send_header("connection", "keep-alive")
+            self.end_headers()
+            try:
+                snapshot = STORE.stream_turns(
+                    conversation_id,
+                    user_text,
+                    on_text=lambda delta: self._send_sse("token", {"delta": delta}),
+                )
+                self._send_sse("done", snapshot)
+            except Exception as exc:  # pragma: no cover - runtime failure path
+                self._send_sse("error", {"error": "generation_failed", "detail": repr(exc)})
+            return
+
         if parsed.path == "/v1/chat/respond":
             payload = self._read_json()
             conversation_id = payload.get("conversationId", DEFAULT_CONVERSATION_ID)
@@ -1194,6 +1235,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("content-length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_sse(self, event: str, payload: dict) -> None:
+        body = f"event: {event}\ndata: {json.dumps(payload)}\n\n".encode("utf-8")
+        self.wfile.write(body)
+        self.wfile.flush()
 
 
 def main() -> None:

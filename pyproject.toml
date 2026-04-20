@@ -8,6 +8,7 @@ requires-python = ">=3.10"
 dependencies = [
   "llama-cpp-python>=0.3.20",
   "numpy>=2.2.0",
+  "optimum-quanto>=0.2.7",
   "pydantic>=2.11.0",
   "rich>=15.0.0",
   "torch>=2.6.0",

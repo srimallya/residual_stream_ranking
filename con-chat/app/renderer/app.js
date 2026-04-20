@@ -54,6 +54,68 @@ function createHttpBridge(baseUrl = "http://127.0.0.1:4318") {
         })
       });
     },
+    async sendMessageStream(text, currentTokens, handlers = {}) {
+      const response = await fetch(`${baseUrl}/v1/chat/stream`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json"
+        },
+        body: JSON.stringify({
+          conversationId: state.conversationId,
+          userText: text,
+          activeWindow: {
+            maxTokens: state.maxTokens,
+            currentTokens
+          }
+        })
+      });
+      if (!response.ok || !response.body) {
+        const detail = await response.text();
+        throw new Error(detail || `http_${response.status}`);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let donePayload = null;
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) {
+          break;
+        }
+        buffer += decoder.decode(value, { stream: true });
+        const events = buffer.split("\n\n");
+        buffer = events.pop() || "";
+        for (const eventBlock of events) {
+          if (!eventBlock.trim()) {
+            continue;
+          }
+          let eventName = "message";
+          const dataLines = [];
+          for (const line of eventBlock.split("\n")) {
+            if (line.startsWith("event:")) {
+              eventName = line.slice(6).trim();
+            } else if (line.startsWith("data:")) {
+              dataLines.push(line.slice(5).trim());
+            }
+          }
+          const payload = JSON.parse(dataLines.join("\n") || "{}");
+          if (eventName === "token") {
+            handlers.onToken?.(payload.delta || "");
+          } else if (eventName === "done") {
+            donePayload = payload;
+          } else if (eventName === "error") {
+            throw new Error(payload.detail || payload.error || "stream_error");
+          }
+        }
+      }
+
+      if (!donePayload) {
+        throw new Error("stream_incomplete");
+      }
+      return donePayload;
+    },
     async resetConversation() {
       return await fetchJson(`${baseUrl}/v1/conversations/${encodeURIComponent(state.conversationId)}/reset`, {
         method: "POST",
@@ -99,6 +161,9 @@ function createUnavailableBridge() {
     },
     async sendMessage() {
       return { ok: false, error: "sidecar_unavailable" };
+    },
+    async sendMessageStream() {
+      throw new Error("sidecar_unavailable");
     },
     async resetConversation() {
       return await this.bootstrapState();
@@ -205,7 +270,7 @@ async function copyText(text) {
   }
 }
 
-const bridge = window.conChat ?? createHttpBridge();
+const bridge = createHttpBridge();
 
 function byId(id) {
   return document.getElementById(id);
@@ -524,9 +589,38 @@ function bindComposer() {
 
     let result;
     try {
-      result = await bridge.sendMessage(text, state.currentTokens);
+      result = await bridge.sendMessageStream(text, state.currentTokens, {
+        onToken(delta) {
+          state.messages = state.messages.map((message) => {
+            if (message.id !== pendingAssistant.id) {
+              return message;
+            }
+            return {
+              ...message,
+              text: `${message.text || ""}${delta}`,
+              thinking: false,
+              pending: true
+            };
+          });
+          renderMessages(state.messages);
+        }
+      });
     } catch (_error) {
-      state.messages = state.messages.filter((message) => message.id !== pendingMessage.id && message.id !== pendingAssistant.id);
+      state.messages = state.messages.map((message) => {
+        if (message.id === pendingMessage.id) {
+          return { ...message, pending: false, failed: true };
+        }
+        if (message.id === pendingAssistant.id) {
+          return {
+            ...message,
+            pending: false,
+            thinking: false,
+            text: "Message failed to send. Check the local sidecar and try again.",
+            failed: true
+          };
+        }
+        return message;
+      });
       renderMessages(state.messages);
       state.sending = false;
       setComposerDisabled(false);

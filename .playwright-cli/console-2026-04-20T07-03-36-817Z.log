@@ -1,0 +1,2 @@
+[      52ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:4318/v1/health:0
+[      53ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:4318/v1/conversations/demo-thread/graph:0

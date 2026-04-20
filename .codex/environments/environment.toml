@@ -8,7 +8,4 @@ script = ""
 [[actions]]
 name = "Run"
 icon = "run"
-command = '''
-cd "/Users/srimallyamaitra/codes/residual stream/con-chat/app/renderer"
-python3 -m http.server 8031
-'''
+command = "cd \"/Users/srimallyamaitra/codes/residual stream\" && (cd \"con-chat/app/renderer\" && python3 -m http.server 8031 >/tmp/con-chat-frontend.log 2>&1 &) && CON_CHAT_PORT=4318 .venv/bin/python con-chat/sidecar/server.py"
