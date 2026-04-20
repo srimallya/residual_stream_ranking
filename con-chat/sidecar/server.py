@@ -26,11 +26,12 @@ MODEL_DEVICE = os.environ.get("CON_CHAT_MODEL_DEVICE", "mps")
 ORCHESTRATION_DEVICE = os.environ.get("CON_CHAT_ORCHESTRATION_DEVICE", "cpu")
 DEFAULT_CONVERSATION_ID = "demo-thread"
 MAX_TOKENS = 32768
-PRIMARY_MAX_NEW_TOKENS = 512
+PRIMARY_MAX_NEW_TOKENS = int(os.environ.get("CON_CHAT_MAX_NEW_TOKENS", "1024"))
 FALLBACK_MAX_NEW_TOKENS = 384
 KV_QUANTIZE_AFTER_TOKENS = int(os.environ.get("CON_CHAT_KV_QUANTIZE_AFTER_TOKENS", "4096"))
 KV_QUANTIZE_BITS = int(os.environ.get("CON_CHAT_KV_QUANTIZE_BITS", "4"))
 KV_QUANTIZE_RESIDUAL_LENGTH = int(os.environ.get("CON_CHAT_KV_QUANTIZE_RESIDUAL_LENGTH", "128"))
+THINK_TOKEN = "<|think|>"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ENTITY_STOPWORDS = {
     "about", "after", "again", "also", "and", "answer", "are", "assist", "based", "because",
@@ -43,10 +44,7 @@ ENTITY_STOPWORDS = {
     "there", "these", "they", "this", "through", "turn", "user", "very", "want", "what",
     "when", "where", "which", "who", "why", "with", "work", "would", "your", "important",
 }
-SYSTEM_PROMPT = """You are Conway, the assistant inside con-chat. Do not describe yourself as being made by Google or any other model vendor unless the user explicitly asks about the backend.
-By default, reply with the final answer only.
-Do not print internal reasoning, hidden analysis, thought traces, symbolic workspace headings, or scaffolding labels like "BOUNDARIES", "RELATIONS", "OBSERVED", "ANSWER", "model response", or "Thinking Process" unless the user explicitly asks to see symbolic reasoning.
-Do not echo the user's question before answering unless clarification is necessary.
+SYSTEM_PROMPT = """You are Conway, an assistant that reasons by creating, revising, and testing provisional symbols.
 
 Core idea:
 - Treat nouns as knowledge boundaries.
@@ -591,6 +589,8 @@ class GemmaRuntime:
         self._maybe_upgrade_session_cache(session)
 
         thinking_text, assistant_text = self._parse_response(raw_generated)
+        preview = raw_generated[:240].replace("\n", "\\n")
+        log_event(f"raw preview={preview!r}", request_id=request_id)
         log_event(
             f"stream reply done completion_tokens={len(generated_ids)} thinking_chars={len(thinking_text)} answer_chars={len(assistant_text)} total_seconds={generation_seconds:.2f}",
             request_id=request_id,
@@ -716,7 +716,7 @@ class GemmaRuntime:
 
     def _format_history(self, turns: list[sqlite3.Row]) -> str:
         bos = self.tokenizer.bos_token if self.tokenizer and self.tokenizer.bos_token else "<bos>"
-        chunks = [bos, self._render_turn("system", SYSTEM_PROMPT)]
+        chunks = [bos, self._render_turn("system", f"{THINK_TOKEN}\n{SYSTEM_PROMPT}")]
         for row in turns:
             role = row["role"]
             text = row["text"]
@@ -747,6 +747,17 @@ class GemmaRuntime:
 
     def _parse_response(self, text: str) -> tuple[str, str]:
         raw = text.strip()
+        thought_prefix = "<|channel>thought\n"
+        thought_start = raw.find(thought_prefix)
+        if thought_start != -1:
+            thought_body = raw[thought_start + len(thought_prefix):]
+            thought_end = thought_body.find("<channel|>")
+            if thought_end == -1:
+                return thought_body.rstrip(), ""
+            thinking = thought_body[:thought_end].strip()
+            content = thought_body[thought_end + len("<channel|>"):].strip()
+            return thinking, self._clean_response(content)
+
         thinking = ""
         content = raw
         if self.response_pattern is not None:
@@ -760,6 +771,7 @@ class GemmaRuntime:
     def _clean_response(self, text: str) -> str:
         cleaned = text.strip()
         cleaned = re.sub(r"<\|turn\>|<turn\|>", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"<\|channel\>\s*", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"<\|channel\>thought\s*", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"<channel\|>", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"<end[_ ]of[_ ]turn>", "", cleaned, flags=re.IGNORECASE)
@@ -929,8 +941,31 @@ class Store:
                 "select * from memory_edges where conversation_id = ? order by created_at asc",
                 (conversation_id,),
             ).fetchall()
+            ledger_rows = conn.execute(
+                """
+                select payload_json
+                from ledger_events
+                where conversation_id = ? and event_type = 'chat-round'
+                order by created_at asc
+                """,
+                (conversation_id,),
+            ).fetchall()
 
         visible_turns = self._stable_visible_turns(turns)
+        thinking_by_assistant_id: dict[str, str] = {}
+        for row in ledger_rows:
+            try:
+                payload = json.loads(row["payload_json"])
+            except Exception:
+                continue
+            assistant_turn_id = payload.get("assistantTurnId")
+            thinking = (
+                (payload.get("timings") or {}).get("thinking")
+                if isinstance(payload, dict)
+                else None
+            )
+            if assistant_turn_id and isinstance(thinking, str) and thinking.strip():
+                thinking_by_assistant_id[str(assistant_turn_id)] = thinking.strip()
         messages = [
             {
                 "id": row["id"],
@@ -943,6 +978,15 @@ class Store:
                     else "Memory Event"
                 ),
                 "text": row["text"],
+                **(
+                    {
+                        "thinking": True,
+                        "thinkingLabel": "thinking",
+                        "thinkingText": thinking_by_assistant_id[row["id"]],
+                    }
+                    if row["role"] == "assistant" and row["id"] in thinking_by_assistant_id
+                    else {}
+                ),
             }
             for row in visible_turns
         ]

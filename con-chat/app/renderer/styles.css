@@ -290,13 +290,12 @@ body {
 .thinking-wrap {
   margin-top: 2px;
   margin-bottom: 2px;
-  max-height: 42px;
-  overflow: hidden;
-  transition: max-height 180ms ease, opacity 180ms ease, margin 180ms ease;
+  max-width: min(64ch, 82vw);
+  overflow: visible;
+  transition: opacity 180ms ease, margin 180ms ease;
 }
 
 .thinking-wrap.collapsing {
-  max-height: 0;
   opacity: 0;
   margin-top: 0;
   margin-bottom: 0;
@@ -312,7 +311,8 @@ body {
   border: 1px solid var(--line);
   background: rgba(17, 19, 24, 0.04);
   color: var(--muted);
-  min-width: 140px;
+  min-width: 180px;
+  max-width: 100%;
 }
 
 .thinking-meta {
@@ -327,12 +327,14 @@ body {
 
 .thinking-text {
   margin-top: 6px;
-  max-width: min(48ch, 60vw);
-  font: 500 10px/1.35 var(--font-ui);
+  width: 100%;
+  max-width: min(62ch, 78vw);
+  font: 500 10px/1.45 var(--font-ui);
   letter-spacing: 0;
   text-transform: none;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+  color: rgba(17, 19, 24, 0.82);
 }
 
 .thinking-bubble::after {

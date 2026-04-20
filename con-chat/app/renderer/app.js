@@ -495,6 +495,7 @@ function renderMessages(messages) {
     .forEach((message) => {
     const article = document.createElement("article");
     article.className = `message ${message.role}${message.pending ? " pending" : ""}`;
+    const hasThinking = Boolean(message.thinking || (message.thinkingText && message.thinkingText.trim()));
 
     const role = document.createElement("div");
     role.className = "message-role";
@@ -504,7 +505,7 @@ function renderMessages(messages) {
     body.className = "message-body";
     body.innerHTML = renderMarkdown(message.text);
 
-    if (message.thinking) {
+    if (hasThinking) {
       const thinkingWrap = document.createElement("div");
       thinkingWrap.className = `thinking-wrap${message.collapsing ? " collapsing" : ""}`;
       const thinkingBubble = document.createElement("div");
@@ -539,7 +540,7 @@ function renderMessages(messages) {
     copy.dataset.copy = message.text;
     copy.textContent = "Copy";
 
-    if (!message.thinking) {
+    if (!hasThinking || message.text) {
       actions.appendChild(copy);
       article.appendChild(actions);
     }
@@ -627,7 +628,7 @@ function bindComposer() {
             return {
               ...message,
               text: `${message.text || ""}${payload.delta || ""}`,
-              thinking: Boolean(payload.thinkingActive),
+              thinking: Boolean(payload.thinkingActive || payload.thinkingDelta || message.thinkingText),
               thinkingText: `${message.thinkingText || ""}${payload.thinkingDelta || ""}`,
               pending: true
             };
@@ -658,15 +659,20 @@ function bindComposer() {
       return;
     }
 
-    state.messages = state.messages.map((message) => (
-      message.id === pendingAssistant.id
-        ? { ...message, collapsing: true }
-        : message
-    ));
-    renderMessages(state.messages);
-    await new Promise((resolve) => window.setTimeout(resolve, 180));
-
-    state.messages = result.messages;
+    const finalThinking = result.timings?.thinking || state.messages.find((message) => message.id === pendingAssistant.id)?.thinkingText || "";
+    const finalMessages = [...result.messages];
+    for (let index = finalMessages.length - 1; index >= 0; index -= 1) {
+      if (finalMessages[index].role === "assistant") {
+        finalMessages[index] = {
+          ...finalMessages[index],
+          thinking: Boolean(finalThinking),
+          thinkingLabel: "thinking",
+          thinkingText: finalThinking
+        };
+        break;
+      }
+    }
+    state.messages = finalMessages;
     setBudget(result.conversation.currentTokens, result.conversation.maxTokens);
     state.graphNodes = result.graph.nodes;
     state.graphEdges = result.graph.edges;
