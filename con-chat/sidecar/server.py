@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig, TextIteratorStreamer
+from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 from transformers.cache_utils import DynamicCache, QuantizedCache
 
 
@@ -504,85 +504,81 @@ class GemmaRuntime:
             request_id=request_id,
         )
 
-        streamer = TextIteratorStreamer(
-            self.tokenizer,
-            skip_prompt=True,
-            skip_special_tokens=False,
-        )
-        generation_kwargs = {
-            "input_ids": suffix_batch.input_ids.to(self.actual_device),
-            "attention_mask": suffix_batch.attention_mask.to(self.actual_device),
-            "past_key_values": session.cache,
-            "use_cache": True,
-            "max_new_tokens": PRIMARY_MAX_NEW_TOKENS,
-            "do_sample": bool(self.generation_config.do_sample),
-            "temperature": float(self.generation_config.temperature),
-            "top_p": float(self.generation_config.top_p),
-            "top_k": int(self.generation_config.top_k),
-            "pad_token_id": int(self.generation_config.pad_token_id),
-            "eos_token_id": self.generation_config.eos_token_id,
-            "return_dict_in_generate": True,
-            "streamer": streamer,
-        }
-
-        generation_holder: dict[str, object] = {}
-        generation_error: list[BaseException] = []
-
-        def _generate() -> None:
-            try:
-                with self.lock, torch.inference_mode():
-                    generation_holder["outputs"] = self.model.generate(**generation_kwargs)
-            except BaseException as exc:  # pragma: no cover - background thread failure path
-                generation_error.append(exc)
-            finally:
-                generation_holder["finished_at"] = time.perf_counter()
-
         generation_start = time.perf_counter()
-        worker = threading.Thread(target=_generate, daemon=True)
-        worker.start()
         log_event("generation worker started", request_id=request_id)
 
+        input_ids = suffix_batch.input_ids.to(self.actual_device)
+        attention_mask = suffix_batch.attention_mask.to(self.actual_device)
+        current_cache = session.cache
+        eos_ids = self.generation_config.eos_token_id
+        if isinstance(eos_ids, int):
+            eos_ids = [eos_ids]
+        eos_id_set = {int(token_id) for token_id in (eos_ids or [])}
         raw_generated = ""
         visible_generated = ""
         thinking_generated = ""
         first_event_logged = False
-        for chunk in streamer:
-            raw_generated += chunk
-            current_thinking, current_visible = self._parse_response(raw_generated)
-            thinking_delta = (
-                current_thinking[len(thinking_generated):]
-                if current_thinking.startswith(thinking_generated)
-                else current_thinking
-            )
-            if current_visible.startswith(visible_generated):
-                delta = current_visible[len(visible_generated) :]
-            else:
-                delta = current_visible
-            if (delta or thinking_delta) and on_text is not None:
-                on_text({
-                    "delta": delta,
-                    "thinkingDelta": thinking_delta,
-                    "thinkingActive": bool(current_thinking),
-                })
-            if not first_event_logged and (delta or thinking_delta):
-                log_event(
-                    f"first stream event content_chars={len(delta)} thinking_chars={len(thinking_delta)}",
-                    request_id=request_id,
+        generated_ids: list[int] = []
+
+        with self.lock, torch.inference_mode():
+            for step in range(PRIMARY_MAX_NEW_TOKENS):
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    past_key_values=current_cache,
+                    use_cache=True,
                 )
-                first_event_logged = True
-            visible_generated = current_visible
-            thinking_generated = current_thinking
+                current_cache = outputs.past_key_values
+                next_token_id = self._sample_next_token(outputs.logits[:, -1, :])
+                generated_ids.append(next_token_id)
+                token_text = self.tokenizer.decode([next_token_id], skip_special_tokens=False)
+                raw_generated += token_text
 
-        worker.join()
-        if generation_error:
-            log_event(f"generation failed error={generation_error[0]!r}", request_id=request_id)
-            raise generation_error[0]
+                next_token = torch.tensor([[next_token_id]], dtype=input_ids.dtype, device=self.actual_device)
+                input_ids = next_token
+                attention_mask = torch.cat(
+                    [attention_mask, torch.ones((attention_mask.shape[0], 1), dtype=attention_mask.dtype, device=self.actual_device)],
+                    dim=1,
+                )
 
-        outputs = generation_holder["outputs"]
-        generation_seconds = float(generation_holder["finished_at"] - generation_start)
-        generated_ids = outputs.sequences[0, prompt_tokens:].detach().cpu().tolist()
+                if step == 0:
+                    log_event(f"first token id={next_token_id} text={token_text!r}", request_id=request_id)
 
-        session.cache = outputs.past_key_values
+                if step % 16 == 0:
+                    log_event(f"decode step={step} generated={len(generated_ids)}", request_id=request_id)
+
+                if next_token_id in eos_id_set:
+                    log_event(f"eos reached token_id={next_token_id} step={step}", request_id=request_id)
+                    break
+
+                current_thinking, current_visible = self._parse_response(raw_generated)
+                thinking_delta = (
+                    current_thinking[len(thinking_generated):]
+                    if current_thinking.startswith(thinking_generated)
+                    else current_thinking
+                )
+                if current_visible.startswith(visible_generated):
+                    delta = current_visible[len(visible_generated) :]
+                else:
+                    delta = current_visible
+                if (delta or thinking_delta) and on_text is not None:
+                    on_text({
+                        "delta": delta,
+                        "thinkingDelta": thinking_delta,
+                        "thinkingActive": bool(current_thinking),
+                    })
+                if not first_event_logged and (delta or thinking_delta):
+                    log_event(
+                        f"first stream event content_chars={len(delta)} thinking_chars={len(thinking_delta)}",
+                        request_id=request_id,
+                    )
+                    first_event_logged = True
+                visible_generated = current_visible
+                thinking_generated = current_thinking
+
+        generation_seconds = time.perf_counter() - generation_start
+
+        session.cache = current_cache
         session.transcript += suffix + raw_generated
         session.token_ids.extend(suffix_batch.input_ids[0].tolist())
         session.token_ids.extend(generated_ids)
@@ -627,6 +623,40 @@ class GemmaRuntime:
             except Exception:
                 self.quantized_cache_supported = False
         return DynamicCache(config=self.model.config if self.model is not None else None)
+
+    def _sample_next_token(self, logits: torch.Tensor) -> int:
+        if not self.generation_config:
+            return int(torch.argmax(logits, dim=-1).item())
+
+        if not bool(self.generation_config.do_sample):
+            return int(torch.argmax(logits, dim=-1).item())
+
+        work = logits.clone()
+        temperature = float(self.generation_config.temperature or 1.0)
+        if temperature > 0 and temperature != 1.0:
+            work = work / temperature
+
+        top_k = int(self.generation_config.top_k or 0)
+        if top_k > 0 and top_k < work.shape[-1]:
+            values, _ = torch.topk(work, top_k)
+            cutoff = values[..., -1, None]
+            work = torch.where(work < cutoff, torch.full_like(work, float("-inf")), work)
+
+        probs = torch.softmax(work, dim=-1)
+        top_p = float(self.generation_config.top_p or 1.0)
+        if 0 < top_p < 1.0:
+            sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+            cumulative = torch.cumsum(sorted_probs, dim=-1)
+            sorted_mask = cumulative > top_p
+            sorted_mask[..., 1:] = sorted_mask[..., :-1].clone()
+            sorted_mask[..., 0] = False
+            sorted_probs = sorted_probs.masked_fill(sorted_mask, 0)
+            sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)
+            sampled_index = torch.multinomial(sorted_probs, num_samples=1)
+            token_id = sorted_indices.gather(-1, sampled_index)
+            return int(token_id.item())
+
+        return int(torch.multinomial(probs, num_samples=1).item())
 
     def _maybe_upgrade_session_cache(self, session: ChatSession) -> None:
         if session.cache_kind == "quantized":

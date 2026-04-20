@@ -46,9 +46,10 @@ body {
 }
 
 .app-header {
+  position: relative;
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-start;
   min-height: 34px;
   padding-left: 6px;
 }
@@ -63,6 +64,9 @@ body {
 }
 
 .app-status {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
   display: inline-flex;
   align-items: center;
   gap: 6px;
