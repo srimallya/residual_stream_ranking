@@ -8,6 +8,7 @@ __pycache__/
 .ruff_cache/
 build/
 dist/
+.playwright-cli/
 
 # Keep local model weights and caches out of Git.
 models/
