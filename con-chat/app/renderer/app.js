@@ -20,14 +20,8 @@ let healthMonitorHandle = 0;
 const PLACEHOLDER_CONVERSATION_IDS = new Set(["offline", "loading", "restarting", "connecting"]);
 
 function setStatusBadge(status, detail = "") {
-  const node = byId("app-status");
-  if (!node) {
-    return;
-  }
-  const normalized = status || "unknown";
-  const tone = normalized === "ready" ? "ready" : normalized === "offline" || normalized === "error" ? "offline" : "busy";
-  node.className = `app-status ${tone}`;
-  node.textContent = detail ? `${normalized} · ${detail}` : normalized;
+  void status;
+  void detail;
 }
 
 function clamp(value, min, max) {
@@ -524,52 +518,22 @@ function renderMessages(messages) {
     article.className = `message ${message.role}${message.pending ? " pending" : ""}`;
     const hasThinking = Boolean(message.thinking || (message.thinkingText && message.thinkingText.trim()));
 
-    const role = document.createElement("div");
-    role.className = "message-role";
-    role.textContent = message.roleLabel;
-
     const body = document.createElement("div");
     body.className = "message-body";
     body.innerHTML = renderMarkdown(message.text);
 
     if (hasThinking) {
-      const thinkingWrap = document.createElement("div");
-      thinkingWrap.className = `thinking-wrap${message.collapsing ? " collapsing" : ""}`;
-      const thinkingBubble = document.createElement("div");
-      thinkingBubble.className = "thinking-bubble";
-      const thinkingMeta = document.createElement("div");
-      thinkingMeta.className = "thinking-meta";
-      thinkingMeta.textContent = message.thinkingLabel || "thinking";
-      thinkingBubble.appendChild(thinkingMeta);
+      const thinkingText = document.createElement("div");
+      thinkingText.className = "message-thinking";
       if (message.thinkingText) {
-        const thinkingText = document.createElement("div");
-        thinkingText.className = "thinking-text";
         thinkingText.textContent = message.thinkingText;
-        thinkingBubble.appendChild(thinkingText);
       }
-      thinkingWrap.appendChild(thinkingBubble);
-      article.appendChild(role);
-      article.appendChild(thinkingWrap);
+      article.appendChild(thinkingText);
       if (message.text) {
         article.appendChild(body);
       }
     } else {
-      article.appendChild(role);
       article.appendChild(body);
-    }
-
-    const actions = document.createElement("div");
-    actions.className = "message-actions";
-
-    const copy = document.createElement("button");
-    copy.type = "button";
-    copy.className = "copy-button";
-    copy.dataset.copy = message.text;
-    copy.textContent = "Copy";
-
-    if (!hasThinking || message.text) {
-      actions.appendChild(copy);
-      article.appendChild(actions);
     }
     thread.appendChild(article);
     });
@@ -779,33 +743,6 @@ function bindComposer() {
     state.sending = false;
     setComposerDisabled(false);
   });
-
-  byId("thread").addEventListener("click", async (event) => {
-    const button = event.target.closest(".copy-button");
-    if (!button) {
-      return;
-    }
-    const text = button.getAttribute("data-copy") || "";
-    try {
-      const ok = await copyText(text);
-      if (!ok) {
-        button.textContent = "Press Cmd+C";
-        window.setTimeout(() => {
-          button.textContent = "Copy";
-        }, 1800);
-        return;
-      }
-      button.textContent = "Copied";
-      window.setTimeout(() => {
-        button.textContent = "Copy";
-      }, 1200);
-    } catch (_error) {
-      button.textContent = "Failed";
-      window.setTimeout(() => {
-        button.textContent = "Copy";
-      }, 1200);
-    }
-  });
 }
 
 function bindGraphControls() {
@@ -876,27 +813,6 @@ function bindGraphControls() {
     if (!state.drag) {
       hideTooltip();
     }
-  });
-
-  byId("conversation-reset").addEventListener("click", async () => {
-    if (state.sending) {
-      return;
-    }
-    let result;
-    try {
-      result = await bridge.resetConversation();
-    } catch (_error) {
-      return;
-    }
-    state.graphTransform = { scale: 1, x: 0, y: 0 };
-    state.messages = result.messages;
-    setBudget(result.conversation.currentTokens, result.conversation.maxTokens);
-    state.graphNodes = result.graph.nodes;
-    state.graphEdges = result.graph.edges;
-    setStatusBadge("ready", state.sidecarDevice);
-    renderMessages(state.messages);
-    drawGraph();
-    hideTooltip();
   });
 }
 

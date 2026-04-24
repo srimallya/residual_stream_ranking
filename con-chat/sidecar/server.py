@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import json
+import numpy as np
 import os
 import re
 import sqlite3
 import sys
 import threading
 import time
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,7 +27,8 @@ MODEL_NAME = os.environ.get("CON_CHAT_MODEL_NAME", "google--gemma-4-E2B-it")
 MODEL_DEVICE = os.environ.get("CON_CHAT_MODEL_DEVICE", "mps")
 ORCHESTRATION_DEVICE = os.environ.get("CON_CHAT_ORCHESTRATION_DEVICE", "cpu")
 DEFAULT_CONVERSATION_ID = "demo-thread"
-MAX_TOKENS = 32768
+ACTIVE_LIMIT = 32768
+MAX_TOKENS = ACTIVE_LIMIT
 PRIMARY_MAX_NEW_TOKENS = int(os.environ.get("CON_CHAT_MAX_NEW_TOKENS", "1024"))
 FALLBACK_MAX_NEW_TOKENS = 384
 KV_QUANTIZE_AFTER_TOKENS = int(os.environ.get("CON_CHAT_KV_QUANTIZE_AFTER_TOKENS", "4096"))
@@ -33,6 +36,13 @@ KV_QUANTIZE_BITS = int(os.environ.get("CON_CHAT_KV_QUANTIZE_BITS", "4"))
 KV_QUANTIZE_RESIDUAL_LENGTH = int(os.environ.get("CON_CHAT_KV_QUANTIZE_RESIDUAL_LENGTH", "128"))
 THINK_TOKEN = "<|think|>"
 REPO_ROOT = Path(__file__).resolve().parents[2]
+MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
+DEFAULT_MEMORY_KIND = "token@34/fp16"
+DEFAULT_REPLAY_LAYER = 34
+RETRIEVAL_LIMIT = 4
+REINJECTION_SCORE_THRESHOLD = 0.35
+REINJECTION_MODE = os.environ.get("CON_CHAT_REINJECTION_MODE", "replay_token_fp16")
+REPLAY_TOKEN_LOGIT_WEIGHT = float(os.environ.get("CON_CHAT_REPLAY_TOKEN_LOGIT_WEIGHT", "0.18"))
 ENTITY_STOPWORDS = {
     "about", "after", "again", "also", "and", "answer", "are", "assist", "based", "because",
     "been", "before", "being", "between", "build", "can", "chat", "con", "continue", "could",
@@ -456,6 +466,8 @@ class GemmaRuntime:
         conversation_id: str,
         turns: list[sqlite3.Row],
         user_text: str,
+        recalled_text: str | None = None,
+        replay_logits_prior: torch.Tensor | None = None,
         on_text: callable | None = None,
         request_id: str | None = None,
     ) -> tuple[str, dict[str, object]]:
@@ -487,7 +499,7 @@ class GemmaRuntime:
                 request_id=request_id,
             )
 
-        suffix = self._format_user_suffix(user_text)
+        suffix = self._format_user_suffix(user_text, recalled_text=recalled_text)
         prompt_start = time.perf_counter()
         suffix_batch = self.tokenizer(
             suffix,
@@ -532,7 +544,13 @@ class GemmaRuntime:
                 )
                 outputs = self.model(**model_inputs)
                 current_cache = outputs.past_key_values
-                next_token_id = self._sample_next_token(outputs.logits[:, -1, :])
+                step_logits = outputs.logits[:, -1, :]
+                if step == 0 and replay_logits_prior is not None:
+                    step_logits = step_logits + (
+                        replay_logits_prior.to(device=step_logits.device, dtype=step_logits.dtype)
+                        * REPLAY_TOKEN_LOGIT_WEIGHT
+                    )
+                next_token_id = self._sample_next_token(step_logits)
                 generated_ids.append(next_token_id)
                 token_text = self.tokenizer.decode([next_token_id], skip_special_tokens=False)
                 raw_generated += token_text
@@ -610,6 +628,67 @@ class GemmaRuntime:
         session = self.sessions.get(conversation_id)
         if session is not None:
             session.last_turn_id = assistant_turn_id
+
+    def build_replay_payload(
+        self,
+        turns: list[sqlite3.Row],
+        *,
+        replay_layer: int = DEFAULT_REPLAY_LAYER,
+    ) -> bytes:
+        if not self.ready or not self.model or not self.tokenizer:
+            return b""
+        transcript = self._format_history(turns)
+        encoded = self.tokenizer(transcript, return_tensors="pt", return_attention_mask=True)
+        with self.lock, torch.inference_mode():
+            outputs = self.model(
+                input_ids=encoded.input_ids.to(self.actual_device),
+                attention_mask=encoded.attention_mask.to(self.actual_device),
+                use_cache=False,
+                output_hidden_states=True,
+            )
+        hidden_states = getattr(outputs, "hidden_states", None)
+        if not hidden_states:
+            return b""
+        hidden_index = min(max(replay_layer, 0) + 1, len(hidden_states) - 1)
+        replay_token = hidden_states[hidden_index][0, -1, :].to(dtype=torch.float16, device="cpu").contiguous()
+        return replay_token.numpy().tobytes()
+
+    def build_replay_logits_prior(
+        self,
+        payload_blob: bytes,
+        *,
+        replay_layer: int,
+    ) -> torch.Tensor:
+        if not self.ready or not self.model:
+            raise RuntimeError(f"model_not_ready:{self.error}")
+        if replay_layer != DEFAULT_REPLAY_LAYER:
+            raise ValueError(f"unsupported_replay_layer:{replay_layer}")
+        text_model = getattr(getattr(self.model, "model", None), "language_model", None)
+        if text_model is None or not hasattr(text_model, "norm"):
+            raise RuntimeError("gemma_text_model_unavailable")
+        text_config = self.model.config.get_text_config() if hasattr(self.model.config, "get_text_config") else self.model.config
+        hidden_size = int(getattr(text_config, "hidden_size"))
+        replay_token = np.frombuffer(payload_blob, dtype=np.float16)
+        if replay_token.size != hidden_size:
+            raise ValueError(f"invalid_replay_payload_size:{replay_token.size}")
+        hidden_tensor = torch.from_numpy(replay_token.astype(np.float32)).to(
+            device=self.actual_device,
+            dtype=self.dtype,
+        ).reshape(1, 1, hidden_size)
+        with self.lock, torch.inference_mode():
+            hidden_tensor = text_model.norm(hidden_tensor)
+            logits = self._apply_output_head(hidden_tensor)[0, -1].detach().to(dtype=torch.float32, device="cpu")
+        return logits
+
+    def _apply_output_head(self, hidden_tensor: torch.Tensor) -> torch.Tensor:
+        logits = self.model.lm_head(hidden_tensor)
+        text_config = self.model.config.get_text_config() if hasattr(self.model.config, "get_text_config") else self.model.config
+        final_logit_softcapping = getattr(text_config, "final_logit_softcapping", None)
+        if final_logit_softcapping is not None:
+            logits = logits / final_logit_softcapping
+            logits = torch.tanh(logits)
+            logits = logits * final_logit_softcapping
+        return logits
 
     def _preferred_cache_kind(self, token_count: int) -> str:
         if self.quantized_cache_supported and token_count >= KV_QUANTIZE_AFTER_TOKENS:
@@ -728,8 +807,18 @@ class GemmaRuntime:
                 chunks.append(self._render_turn("model", text))
         return "".join(chunks)
 
-    def _format_user_suffix(self, user_text: str) -> str:
-        return self._render_turn("user", user_text) + "<|turn>model\n"
+    def _format_user_suffix(self, user_text: str, *, recalled_text: str | None = None) -> str:
+        chunks: list[str] = []
+        if recalled_text:
+            chunks.append(
+                self._render_turn(
+                    "system",
+                    "Recalled memory from earlier in this conversation:\n" + recalled_text.strip(),
+                )
+            )
+        chunks.append(self._render_turn("user", user_text))
+        chunks.append("<|turn>model\n")
+        return "".join(chunks)
 
     def _render_turn(self, role: str, text: str) -> str:
         return f"<|turn>{role}\n{text}<turn|>\n"
@@ -795,7 +884,15 @@ class GemmaRuntime:
 
     def _is_degenerate_response(self, text: str) -> bool:
         normalized = " ".join(text.strip().split()).lower()
-        return not normalized or normalized.startswith("i hit a bad completion on that turn")
+        if not normalized:
+            return True
+        if normalized.startswith("i hit a bad completion on that turn"):
+            return True
+        if normalized in {"<eos>", "<bos>", "<pad>"}:
+            return True
+        if re.fullmatch(r"(?:<[^>]+>\s*)+", normalized):
+            return True
+        return False
 
     def _identity_override(self, user_text: str) -> str | None:
         normalized = " ".join(user_text.lower().split())
@@ -834,64 +931,65 @@ class Store:
 
     def _init_db(self) -> None:
         with self.connect() as conn:
-            conn.executescript(
+            conn.execute(
                 """
-                create table if not exists conversations (
-                  id text primary key,
-                  title text not null,
-                  current_tokens integer not null,
-                  max_tokens integer not null,
-                  created_at text not null,
-                  updated_at text not null
-                );
-
-                create table if not exists turns (
-                  id text primary key,
-                  conversation_id text not null,
-                  role text not null,
-                  text text not null,
-                  token_count integer not null,
-                  created_at text not null
-                );
-
-                create table if not exists memory_objects (
-                  id text primary key,
-                  conversation_id text not null,
-                  kind text not null,
-                  tier text not null,
-                  byte_size integer not null,
-                  source_turn_start text not null,
-                  source_turn_end text not null,
-                  summary text not null,
-                  last_used_at text not null,
-                  created_at text not null
-                );
-
-                create table if not exists memory_edges (
-                  id text primary key,
-                  conversation_id text not null,
-                  from_id text not null,
-                  to_id text not null,
-                  edge_type text not null,
-                  created_at text not null
-                );
-
-                create table if not exists ledger_events (
-                  id text primary key,
-                  conversation_id text not null,
-                  object_id text,
-                  event_type text not null,
-                  payload_json text not null,
-                  created_at text not null
-                );
-
-                create table if not exists settings (
-                  key text primary key,
-                  value_json text not null,
-                  updated_at text not null
-                );
+                create table if not exists schema_migrations (
+                  name text primary key,
+                  applied_at text not null
+                )
                 """
             )
+            applied = {
+                row["name"]
+                for row in conn.execute("select name from schema_migrations order by name asc").fetchall()
+            }
+            existing_tables = {
+                row["name"]
+                for row in conn.execute(
+                    "select name from sqlite_master where type = 'table'"
+                ).fetchall()
+            }
+            legacy_tables = {
+                "conversations",
+                "turns",
+                "memory_objects",
+                "memory_edges",
+                "ledger_events",
+                "settings",
+            }
+            if not applied and legacy_tables.issubset(existing_tables):
+                conn.execute(
+                    "insert into schema_migrations (name, applied_at) values (?, ?)",
+                    ("0001_initial.sql", now_iso()),
+                )
+                applied.add("0001_initial.sql")
+            if "memory_objects" in existing_tables and "0002_memory_objects_v2.sql" not in applied:
+                memory_columns = {
+                    row["name"]
+                    for row in conn.execute("pragma table_info(memory_objects)").fetchall()
+                }
+                required_v2_columns = {
+                    "replay_layer",
+                    "payload_blob",
+                    "fallback_text",
+                    "retrieval_key",
+                    "graph_metadata_json",
+                    "pinned",
+                }
+                if required_v2_columns.issubset(memory_columns):
+                    conn.execute(
+                        "insert into schema_migrations (name, applied_at) values (?, ?)",
+                        ("0002_memory_objects_v2.sql", now_iso()),
+                    )
+                    applied.add("0002_memory_objects_v2.sql")
+            for migration_path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+                if migration_path.name in applied:
+                    continue
+                conn.executescript(migration_path.read_text())
+                conn.execute(
+                    "insert into schema_migrations (name, applied_at) values (?, ?)",
+                    (migration_path.name, now_iso()),
+                )
 
     def _ensure_seed(self) -> None:
         with self.connect() as conn:
@@ -966,7 +1064,7 @@ class Store:
                 """
                 select * from memory_objects
                 where conversation_id = ?
-                order by last_used_at desc, created_at desc
+                order by created_at desc
                 limit 1
                 """,
                 (conversation_id,),
@@ -1071,30 +1169,116 @@ class Store:
                 "select * from turns where conversation_id = ? order by created_at asc",
                 (conversation_id,),
             ).fetchall()
-        prompt_turns = self._prompt_turns(prior_turns)
+            prompt_turns, active_tokens_before = self._prompt_turns(conn, conversation_id, prior_turns)
+            retrieval_rows = self._retrieve_memory_candidates(
+                conn,
+                conversation_id,
+                user_text,
+                limit=RETRIEVAL_LIMIT,
+            )
+        retrieval_candidates = [self._retrieval_candidate_view(row) for row in retrieval_rows]
+        selected_retrieval = self._select_reinjection_candidate(retrieval_rows)
+        reinjection = {
+            "selectedObjectId": None,
+            "selectedKind": None,
+            "selectedScore": 0.0,
+            "reinjected": False,
+            "reinjectionMode": "none",
+        }
+        recalled_text: str | None = None
+        replay_logits_prior: torch.Tensor | None = None
+        if selected_retrieval is not None:
+            reinjection["selectedObjectId"] = selected_retrieval["id"]
+            reinjection["selectedKind"] = selected_retrieval["kind"]
+            reinjection["selectedScore"] = round(float(selected_retrieval["score"]), 4)
+            try:
+                if REINJECTION_MODE == "replay_token_fp16":
+                    replay_logits_prior = self.runtime.build_replay_logits_prior(
+                        selected_retrieval["payload_blob"],
+                        replay_layer=int(selected_retrieval["replay_layer"]),
+                    )
+                    reinjection["reinjected"] = True
+                    reinjection["reinjectionMode"] = "replay_token_fp16"
+                elif REINJECTION_MODE == "text_fallback":
+                    recalled_text = self._build_reinjection_text(selected_retrieval)
+                    reinjection["reinjected"] = bool(recalled_text)
+                    reinjection["reinjectionMode"] = "text_fallback" if recalled_text else "none"
+                else:
+                    raise ValueError(f"unsupported_reinjection_mode:{REINJECTION_MODE}")
+                log_event(
+                    f"reinjection selected conversation={conversation_id} memory_id={selected_retrieval['id']} "
+                    f"score={float(selected_retrieval['score']):.3f} replay_layer={selected_retrieval['replay_layer']} "
+                    f"reinjected={str(reinjection['reinjected']).lower()} mode={reinjection['reinjectionMode']}",
+                    request_id=request_id,
+                )
+            except Exception as exc:
+                log_event(
+                    f"reinjection skipped conversation={conversation_id} memory_id={selected_retrieval['id']} "
+                    f"score={float(selected_retrieval['score']):.3f} replay_layer={selected_retrieval['replay_layer']} "
+                    f"reinjected=false error={exc!r}",
+                    request_id=request_id,
+                )
+                recalled_text = None
         log_event(
-            f"round start conversation={conversation_id} prior_turns={len(prompt_turns)} user_tokens={user_tokens}",
+            f"round start conversation={conversation_id} prior_turns={len(prompt_turns)} active_tokens={active_tokens_before} user_tokens={user_tokens}",
             request_id=request_id,
         )
+        if retrieval_candidates:
+            log_event(
+                "retrieval candidates "
+                + ", ".join(
+                    f"{candidate['id']}:{candidate['score']:.3f}:{candidate['kind']}"
+                    for candidate in retrieval_candidates
+                ),
+                request_id=request_id,
+            )
+        else:
+            log_event("retrieval candidates none", request_id=request_id)
         assistant_text, timings = self.runtime.stream_reply(
             conversation_id=conversation_id,
             turns=prompt_turns,
             user_text=user_text,
+            recalled_text=recalled_text,
+            replay_logits_prior=replay_logits_prior,
             on_text=on_text,
             request_id=request_id,
         )
+        if self._should_retry_reinjection_result(assistant_text) and reinjection["reinjected"]:
+            log_event(
+                f"reinjection retry conversation={conversation_id} memory_id={reinjection['selectedObjectId']} "
+                "reason=degenerate_visible_answer",
+                request_id=request_id,
+            )
+            self.runtime.invalidate_session(conversation_id)
+            retry_recalled_text: str | None = None
+            retry_replay_logits_prior: torch.Tensor | None = None
+            retry_mode = "none"
+            if selected_retrieval is not None:
+                try:
+                    retry_recalled_text = self._build_reinjection_text(selected_retrieval)
+                    if retry_recalled_text:
+                        retry_mode = "text_fallback"
+                except Exception:
+                    retry_recalled_text = None
+            if retry_mode == "none":
+                reinjection["reinjected"] = False
+                reinjection["reinjectionMode"] = "none"
+            else:
+                reinjection["reinjected"] = True
+                reinjection["reinjectionMode"] = retry_mode
+            assistant_text, timings = self.runtime.stream_reply(
+                conversation_id=conversation_id,
+                turns=prompt_turns,
+                user_text=user_text,
+                recalled_text=retry_recalled_text,
+                replay_logits_prior=retry_replay_logits_prior,
+                on_text=on_text,
+                request_id=request_id,
+            )
         assistant_tokens = max(self.runtime.count_tokens(assistant_text), timings["completionTokens"])
 
         persistence_start = time.perf_counter()
         with self.connect() as conn:
-            conversation = conn.execute(
-                "select * from conversations where id = ?",
-                (conversation_id,),
-            ).fetchone()
-            current_tokens = min(
-                conversation["current_tokens"] + user_tokens + assistant_tokens,
-                conversation["max_tokens"],
-            )
             conn.execute(
                 """
                 insert into turns (id, conversation_id, role, text, token_count, created_at)
@@ -1115,18 +1299,9 @@ class Store:
                 set current_tokens = ?, updated_at = ?
                 where id = ?
                 """,
-                (current_tokens, created_at, conversation_id),
+                (active_tokens_before + user_tokens + assistant_tokens, created_at, conversation_id),
             )
 
-            last_memory = conn.execute(
-                """
-                select id from memory_objects
-                where conversation_id = ?
-                order by created_at desc
-                limit 1
-                """,
-                (conversation_id,),
-            ).fetchone()
             prev_turn = conn.execute(
                 """
                 select id from turns
@@ -1152,16 +1327,16 @@ class Store:
                 """,
                 (f"edge-{user_id}-reply", conversation_id, user_id, assistant_id, "chronological", created_at),
             )
-            if last_memory:
+            if reinjection["reinjected"] and reinjection["selectedObjectId"]:
                 conn.execute(
                     """
                     insert into memory_edges (id, conversation_id, from_id, to_id, edge_type, created_at)
                     values (?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        f"edge-{last_memory['id']}-{assistant_id}",
+                        f"edge-{reinjection['selectedObjectId']}-{assistant_id}-recalled",
                         conversation_id,
-                        last_memory["id"],
+                        reinjection["selectedObjectId"],
                         assistant_id,
                         "recalled-into",
                         created_at,
@@ -1169,8 +1344,9 @@ class Store:
                 )
                 conn.execute(
                     "update memory_objects set last_used_at = ? where id = ?",
-                    (created_at, last_memory["id"]),
+                    (created_at, reinjection["selectedObjectId"]),
                 )
+            sealed_memory_id, _active_tokens_after = self._seal_overflow_if_needed(conn, conversation_id)
             conn.execute(
                 """
                 insert into ledger_events (id, conversation_id, object_id, event_type, payload_json, created_at)
@@ -1179,12 +1355,15 @@ class Store:
                 (
                     f"ledger-{assistant_id}",
                     conversation_id,
-                    last_memory["id"] if last_memory else None,
+                    sealed_memory_id,
                     "chat-round",
                     json.dumps(
                         {
                             "userTurnId": user_id,
                             "assistantTurnId": assistant_id,
+                            "sealedObjectId": sealed_memory_id,
+                            "retrievalCandidates": retrieval_candidates,
+                            "retrieval": reinjection,
                             "timings": timings,
                         }
                     ),
@@ -1204,6 +1383,14 @@ class Store:
             **timings,
             "persistenceSeconds": round(persistence_seconds, 4),
             "totalRoundTripSeconds": round(timings["totalModelSeconds"] + persistence_seconds, 4),
+        }
+        snapshot["retrieval"] = {
+            "candidates": retrieval_candidates,
+            "selected_object_id": reinjection["selectedObjectId"],
+            "selected_kind": reinjection["selectedKind"],
+            "selected_score": reinjection["selectedScore"],
+            "reinjected": reinjection["reinjected"],
+            "reinjection_mode": reinjection["reinjectionMode"],
         }
         return snapshot
 
@@ -1236,18 +1423,312 @@ class Store:
             return False
         return True
 
-    def _prompt_turns(self, rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
-        visible = self._stable_visible_turns(rows)
+    def _should_retry_reinjection_result(self, assistant_text: str) -> bool:
+        if not assistant_text.strip():
+            return True
+        return self.runtime._is_degenerate_response(assistant_text)
+
+    def _prompt_turns(
+        self,
+        conn: sqlite3.Connection,
+        conversation_id: str,
+        rows: list[sqlite3.Row],
+    ) -> tuple[list[sqlite3.Row], int]:
+        active_rows = self._active_visible_turns(conn, conversation_id, rows)
+        return self._bounded_active_window(active_rows)
+
+    def _bounded_active_window(
+        self,
+        rows: list[sqlite3.Row],
+        *,
+        token_budget: int = ACTIVE_LIMIT,
+    ) -> tuple[list[sqlite3.Row], int]:
         selected: list[sqlite3.Row] = []
         running_tokens = 0
-        budget = max(1024, MAX_TOKENS - PRIMARY_MAX_NEW_TOKENS - 512)
-        for row in reversed(visible):
+        for row in reversed(rows):
             token_count = int(row["token_count"])
-            if selected and (running_tokens + token_count) > budget:
+            if selected and (running_tokens + token_count) > token_budget:
                 break
             selected.append(row)
             running_tokens += token_count
-        return list(reversed(selected))
+        return list(reversed(selected)), running_tokens
+
+    def _active_visible_turns(
+        self,
+        conn: sqlite3.Connection,
+        conversation_id: str,
+        rows: list[sqlite3.Row],
+    ) -> list[sqlite3.Row]:
+        stable = self._stable_visible_turns(rows)
+        latest_sealed_end = conn.execute(
+            """
+            select source_turn_end
+            from memory_objects
+            where conversation_id = ?
+            order by created_at desc
+            limit 1
+            """,
+            (conversation_id,),
+        ).fetchone()
+        if not latest_sealed_end:
+            return stable
+        cutoff_id = latest_sealed_end["source_turn_end"]
+        for index, row in enumerate(stable):
+            if row["id"] == cutoff_id:
+                return stable[index + 1 :]
+        return stable
+
+    def _seal_overflow_if_needed(
+        self,
+        conn: sqlite3.Connection,
+        conversation_id: str,
+    ) -> tuple[str | None, int]:
+        rows = conn.execute(
+            "select * from turns where conversation_id = ? order by created_at asc",
+            (conversation_id,),
+        ).fetchall()
+        active_rows = self._active_visible_turns(conn, conversation_id, rows)
+        active_tokens = sum(int(row["token_count"]) for row in active_rows)
+        log_event(
+            f"seal check conversation={conversation_id} pre_seal_tokens={active_tokens} active_rows={len(active_rows)}"
+        )
+        if active_tokens <= ACTIVE_LIMIT:
+            conn.execute(
+                "update conversations set current_tokens = ?, updated_at = ? where id = ?",
+                (active_tokens, now_iso(), conversation_id),
+            )
+            return None, active_tokens
+
+        remaining_rows = list(active_rows)
+        remaining_tokens = active_tokens
+        sealed_rows: list[sqlite3.Row] = []
+        while remaining_tokens > ACTIVE_LIMIT and len(remaining_rows) > 2:
+            span = self._pop_oldest_stable_span(remaining_rows)
+            if not span:
+                break
+            sealed_rows.extend(span)
+            remaining_tokens -= sum(int(row["token_count"]) for row in span)
+
+        if not sealed_rows:
+            conn.execute(
+                "update conversations set current_tokens = ?, updated_at = ? where id = ?",
+                (min(active_tokens, ACTIVE_LIMIT), now_iso(), conversation_id),
+            )
+            return None, min(active_tokens, ACTIVE_LIMIT)
+
+        sealed_text = self._sealed_fallback_text(sealed_rows)
+        retrieval_key = self._retrieval_key(sealed_text)
+        object_id = f"memory-{int(datetime.now().timestamp() * 1000)}"
+        created_at = now_iso()
+        source_start = sealed_rows[0]["id"]
+        source_end = sealed_rows[-1]["id"]
+        log_event(
+            f"seal candidate conversation={conversation_id} turn_range={source_start}..{source_end} replay_layer={DEFAULT_REPLAY_LAYER}"
+        )
+        try:
+            payload = self.runtime.build_replay_payload(sealed_rows, replay_layer=DEFAULT_REPLAY_LAYER)
+        except Exception as exc:
+            conn.execute(
+                "update conversations set current_tokens = ?, updated_at = ? where id = ?",
+                (active_tokens, created_at, conversation_id),
+            )
+            log_event(
+                f"seal skipped conversation={conversation_id} reason=payload_build_failed error={exc!r}"
+            )
+            return None, active_tokens
+        graph_metadata = json.dumps(
+            {
+                "turnCount": len(sealed_rows),
+                "tokenCount": sum(int(row["token_count"]) for row in sealed_rows),
+                "sourceTurnStart": source_start,
+                "sourceTurnEnd": source_end,
+            }
+        )
+        summary = " ".join(sealed_text.split())[:160].strip() or "Sealed memory span"
+        conn.execute(
+            """
+            insert into memory_objects (
+              id,
+              conversation_id,
+              kind,
+              tier,
+              byte_size,
+              source_turn_start,
+              source_turn_end,
+              summary,
+              replay_layer,
+              payload_blob,
+              fallback_text,
+              retrieval_key,
+              graph_metadata_json,
+              pinned,
+              last_used_at,
+              created_at
+            )
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                object_id,
+                conversation_id,
+                DEFAULT_MEMORY_KIND,
+                "warm",
+                len(payload),
+                source_start,
+                source_end,
+                summary,
+                DEFAULT_REPLAY_LAYER,
+                payload,
+                sealed_text,
+                retrieval_key,
+                graph_metadata,
+                0,
+                created_at,
+                created_at,
+            ),
+        )
+        conn.execute(
+            """
+            insert into memory_edges (id, conversation_id, from_id, to_id, edge_type, created_at)
+            values (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                f"edge-{source_end}-{object_id}-compressed",
+                conversation_id,
+                source_end,
+                object_id,
+                "compressed-into",
+                created_at,
+            ),
+        )
+        conn.execute(
+            """
+            insert into ledger_events (id, conversation_id, object_id, event_type, payload_json, created_at)
+            values (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                f"ledger-{object_id}",
+                conversation_id,
+                object_id,
+                "memory-sealed",
+                json.dumps(
+                    {
+                        "sourceTurnStart": source_start,
+                        "sourceTurnEnd": source_end,
+                        "kind": DEFAULT_MEMORY_KIND,
+                        "byteSize": len(payload),
+                    }
+                ),
+                created_at,
+            ),
+        )
+        conn.execute(
+            "update conversations set current_tokens = ?, updated_at = ? where id = ?",
+            (remaining_tokens, created_at, conversation_id),
+        )
+        log_event(
+            f"sealed memory conversation={conversation_id} object={object_id} turns={len(sealed_rows)} replay_layer={DEFAULT_REPLAY_LAYER} payload_bytes={len(payload)} post_seal_tokens={remaining_tokens}"
+        )
+        return object_id, remaining_tokens
+
+    def _pop_oldest_stable_span(self, rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
+        if not rows:
+            return []
+        span = [rows.pop(0)]
+        if span[0]["role"] == "user" and rows and rows[0]["role"] == "assistant":
+            span.append(rows.pop(0))
+        return span
+
+    def _sealed_fallback_text(self, rows: list[sqlite3.Row]) -> str:
+        parts = []
+        for row in rows:
+            role = "User" if row["role"] == "user" else "Assistant"
+            parts.append(f"{role}: {row['text']}".strip())
+        return "\n\n".join(parts)
+
+    def _retrieval_key(self, text: str) -> str:
+        normalized = " ".join(text.lower().split())
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+        return f"{digest}:{normalized[:512]}"
+
+    def _retrieve_memory_candidates(
+        self,
+        conn: sqlite3.Connection,
+        conversation_id: str,
+        query_text: str,
+        *,
+        limit: int,
+    ) -> list[dict[str, object]]:
+        query_terms = {
+            token.lower()
+            for token in re.findall(r"[A-Za-z][A-Za-z0-9'-]{2,}", query_text)
+            if token.lower() not in ENTITY_STOPWORDS
+        }
+        if not query_terms:
+            return []
+        rows = conn.execute(
+            """
+            select id, kind, tier, replay_layer, byte_size, source_turn_start, source_turn_end, summary, fallback_text, retrieval_key, payload_blob
+            from memory_objects
+            where conversation_id = ?
+            order by created_at desc
+            """,
+            (conversation_id,),
+        ).fetchall()
+        scored: list[dict[str, object]] = []
+        for row in rows:
+            haystack = " ".join(
+                part for part in (row["retrieval_key"], row["summary"], row["fallback_text"]) if isinstance(part, str)
+            ).lower()
+            overlap = sorted(term for term in query_terms if term in haystack)
+            if not overlap:
+                continue
+            score = len(overlap) / max(len(query_terms), 1)
+            scored.append(
+                {
+                    "id": row["id"],
+                    "kind": row["kind"],
+                    "tier": row["tier"],
+                    "replay_layer": row["replay_layer"],
+                    "byte_size": row["byte_size"],
+                    "source_turn_start": row["source_turn_start"],
+                    "source_turn_end": row["source_turn_end"],
+                    "summary": row["summary"],
+                    "fallback_text": row["fallback_text"],
+                    "payload_blob": row["payload_blob"],
+                    "score": round(score, 4),
+                    "matched_terms": overlap[:8],
+                }
+            )
+        scored.sort(key=lambda candidate: (-float(candidate["score"]), str(candidate["id"])))
+        return scored[:limit]
+
+    def _retrieval_candidate_view(self, row: dict[str, object]) -> dict[str, object]:
+        return {
+            "id": row["id"],
+            "kind": row["kind"],
+            "tier": row["tier"],
+            "replayLayer": row["replay_layer"],
+            "bytes": row["byte_size"],
+            "turnRange": f"{row['source_turn_start']}..{row['source_turn_end']}",
+            "score": row["score"],
+            "matchedTerms": row["matched_terms"],
+        }
+
+    def _select_reinjection_candidate(self, rows: list[dict[str, object]]) -> dict[str, object] | None:
+        if not rows:
+            return None
+        top = rows[0]
+        if top["kind"] != DEFAULT_MEMORY_KIND:
+            return None
+        if float(top["score"]) < REINJECTION_SCORE_THRESHOLD:
+            return None
+        return top
+
+    def _build_reinjection_text(self, row: dict[str, object]) -> str:
+        fallback_text = str(row.get("fallback_text") or "").strip()
+        if not fallback_text:
+            raise ValueError("missing fallback_text")
+        return fallback_text
 
     def _stable_visible_turns(self, rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
         stable: list[sqlite3.Row] = []
@@ -1288,13 +1769,15 @@ class Store:
             nodes.append(GraphNode(row["id"], label, "turn", 72, y, detail))
             y += 78
         if memory:
-            nodes.append(GraphNode(memory["id"], "Memory", "memory", 196, 156, "Compacted memory object"))
+            memory_detail = (
+                f"{memory['kind']} · {memory['tier']} · {memory['byte_size']} bytes · "
+                f"{memory['source_turn_start']}..{memory['source_turn_end']}"
+            )
+            nodes.append(GraphNode(memory["id"], "Memory", "memory", 196, 156, memory_detail))
         if visible_turns:
             active_row = visible_turns[-1]
             active_detail = active_row["text"][:120].strip() or "Active turn"
             nodes.append(GraphNode(active_row["id"], "Active", "active", 72, max(320, y), active_detail))
-        if memory and visible_turns:
-            nodes.append(GraphNode(f"recall-{memory['id']}", "Recalled", "recalled", 196, max(364, y + 18), "Memory recalled into the active thread"))
 
         entity_terms = self._entity_terms(visible_turns)
         entity_y = 86
@@ -1331,6 +1814,7 @@ class Store:
             "tier": row["tier"],
             "bytes": row["byte_size"],
             "turnRange": f"{row['source_turn_start']}..{row['source_turn_end']}",
+            "pinned": bool(row["pinned"]) if "pinned" in row.keys() else False,
             "lastUsedLabel": "recently",
         }
 

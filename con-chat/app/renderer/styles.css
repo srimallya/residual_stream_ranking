@@ -25,10 +25,7 @@ body {
   width: 100%;
   height: 100%;
   overflow: hidden;
-  background:
-    linear-gradient(90deg, rgba(11, 87, 208, 0.05) 0 14px, transparent 14px 100%),
-    linear-gradient(180deg, rgba(215, 38, 56, 0.05) 0 14px, transparent 14px 100%),
-    var(--bg);
+  background: var(--bg);
   color: var(--text);
   font-family: var(--font-ui);
 }
@@ -41,17 +38,15 @@ body {
   height: 100vh;
   display: grid;
   grid-template-rows: auto 1fr;
-  gap: 8px;
-  padding: clamp(10px, 1.15vw, 14px);
+  gap: 10px;
+  padding: 12px;
 }
 
 .app-header {
-  position: relative;
   display: flex;
   align-items: center;
-  justify-content: flex-start;
-  min-height: 34px;
-  padding-left: 6px;
+  min-height: 28px;
+  padding-left: 2px;
 }
 
 .app-header h1 {
@@ -63,51 +58,11 @@ body {
   color: var(--muted);
 }
 
-.app-status {
-  position: absolute;
-  left: 50%;
-  transform: translateX(-50%);
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  min-height: 28px;
-  padding: 6px 10px;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.72);
-  color: var(--muted);
-  font: 600 10px/1 var(--font-ui);
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-
-.app-status.ready {
-  color: #2b6b37;
-}
-
-.app-status.ready::before,
-.app-status.offline::before,
-.app-status.busy::before {
-  content: "";
-  width: 7px;
-  height: 7px;
-  border-radius: 999px;
-  background: currentColor;
-}
-
-.app-status.offline {
-  color: #9b3f31;
-}
-
-.app-status.busy {
-  color: #8d6a13;
-}
-
 .workspace {
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) clamp(220px, 22vw, 290px);
-  gap: 10px;
+  grid-template-columns: minmax(0, 1fr) 280px;
+  gap: 12px;
 }
 
 .chat-panel,
@@ -116,7 +71,7 @@ body {
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--panel);
-  box-shadow: var(--shadow);
+  box-shadow: none;
 }
 
 .chat-panel {
@@ -129,10 +84,10 @@ body {
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
-  padding: 10px;
+  padding: 12px;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 10px;
   -webkit-overflow-scrolling: touch;
   scroll-behavior: smooth;
 }
@@ -151,9 +106,9 @@ body {
 
 .message {
   max-width: min(62ch, 78%);
-  padding: 8px 10px;
-  border-radius: 4px;
-  line-height: 1.32;
+  padding: 10px 12px;
+  border-radius: 8px;
+  line-height: 1.4;
   border: 1px solid var(--line);
 }
 
@@ -246,33 +201,6 @@ body {
   text-decoration: underline;
 }
 
-.message-actions {
-  display: flex;
-  justify-content: flex-end;
-  margin-top: 7px;
-}
-
-.copy-button {
-  border: 1px solid var(--line);
-  background: transparent;
-  color: var(--muted);
-  border-radius: 999px;
-  padding: 4px 8px;
-  font: 600 9px/1 var(--font-ui);
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  cursor: pointer;
-}
-
-.message-role {
-  margin-bottom: 3px;
-  color: var(--muted);
-  font-size: 8px;
-  font-weight: 600;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-}
-
 .message.user {
   align-self: flex-end;
   background: var(--user);
@@ -287,66 +215,12 @@ body {
   opacity: 0.74;
 }
 
-.thinking-wrap {
-  margin-top: 2px;
-  margin-bottom: 2px;
-  max-width: min(64ch, 82vw);
-  overflow: visible;
-  transition: opacity 180ms ease, margin 180ms ease;
-}
-
-.thinking-wrap.collapsing {
-  opacity: 0;
-  margin-top: 0;
-  margin-bottom: 0;
-}
-
-.thinking-bubble {
-  display: inline-flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 6px;
-  padding: 5px 9px;
-  border-radius: 12px;
-  border: 1px solid var(--line);
-  background: rgba(17, 19, 24, 0.04);
-  color: var(--muted);
-  min-width: 180px;
-  max-width: 100%;
-}
-
-.thinking-meta {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font: 600 9px/1 var(--font-ui);
-  letter-spacing: 0.08em;
-  text-transform: lowercase;
-  white-space: nowrap;
-}
-
-.thinking-text {
-  margin-top: 6px;
-  width: 100%;
-  max-width: min(62ch, 78vw);
-  font: 500 10px/1.45 var(--font-ui);
-  letter-spacing: 0;
-  text-transform: none;
+.message-thinking {
+  margin-bottom: 8px;
+  font: 500 10px/1.5 var(--font-ui);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  color: rgba(17, 19, 24, 0.82);
-}
-
-.thinking-bubble::after {
-  content: "";
-  width: 18px;
-  height: 6px;
-  border-radius: 999px;
-  background:
-    radial-gradient(circle at 3px 3px, rgba(17, 19, 24, 0.66) 0 1.5px, transparent 1.6px),
-    radial-gradient(circle at 9px 3px, rgba(17, 19, 24, 0.66) 0 1.5px, transparent 1.6px),
-    radial-gradient(circle at 15px 3px, rgba(17, 19, 24, 0.66) 0 1.5px, transparent 1.6px);
-  animation: thinkingPulse 1s linear infinite;
+  color: var(--muted);
 }
 
 .composer {
@@ -398,70 +272,23 @@ body {
   border: 1px solid var(--line);
 }
 
-@keyframes thinkingPulse {
-  0% { opacity: 0.35; }
-  50% { opacity: 1; }
-  100% { opacity: 0.35; }
-}
-
 .graph-rail {
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
   overflow: hidden;
-}
-
-.graph-toolbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 8px 10px;
-  border-bottom: 1px solid var(--line);
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.11em;
-  text-transform: uppercase;
-  color: var(--muted);
-  background:
-    linear-gradient(90deg, rgba(11, 87, 208, 0.08) 0 6px, transparent 6px 100%),
-    var(--panel-soft);
-}
-
-.graph-controls {
-  display: flex;
-  gap: 6px;
-}
-
-.graph-button {
-  min-width: 44px;
-  height: 28px;
-  padding: 0 9px;
-  background: white;
-  color: var(--text);
-  font-size: 10px;
-  border: 1px solid var(--line);
-  font-weight: 650;
 }
 
 .graph-stage {
   position: relative;
   min-height: 0;
-  overflow: auto;
-  padding: 6px;
-  -webkit-overflow-scrolling: touch;
-  scroll-behavior: smooth;
+  overflow: hidden;
+  padding: 8px;
 }
 
 .graph-canvas {
   width: 100%;
-  min-height: 100%;
+  height: 100%;
   display: block;
   border-radius: 4px;
-  background:
-    linear-gradient(0deg, rgba(11, 87, 208, 0.05) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(11, 87, 208, 0.05) 1px, transparent 1px),
-    white;
-  background-size: 24px 24px;
+  background: #fff;
 }
 
 .graph-tooltip {

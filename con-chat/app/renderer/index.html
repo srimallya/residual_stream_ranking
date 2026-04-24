@@ -14,7 +14,6 @@
     <div class="app-shell">
       <header class="app-header">
         <h1>con-chat</h1>
-        <div class="app-status" id="app-status" role="status" aria-live="polite">connecting</div>
       </header>
 
       <main class="workspace">
@@ -28,12 +27,6 @@
         </section>
 
         <aside class="graph-rail">
-          <div class="graph-toolbar">
-            <span>Graph</span>
-            <div class="graph-controls">
-              <button type="button" class="graph-button" id="conversation-reset" aria-label="Reset conversation" title="Reset this thread, graph, and local cached session.">Reset</button>
-            </div>
-          </div>
           <div class="graph-stage" id="graph-stage">
             <svg id="memory-graph" viewBox="0 0 320 720" class="graph-canvas" aria-label="Conversation memory graph"></svg>
             <div class="graph-tooltip" id="graph-tooltip" role="status" aria-live="polite"></div>
