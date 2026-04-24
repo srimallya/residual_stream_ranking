@@ -70,3 +70,9 @@ The scaffold is intentionally thin but already executable as a product boundary:
 - the sidecar loads Gemma once, keeps it resident, assembles prompts with `tokenizer.apply_chat_template`, uses KV cache for active-session continuity, and streams real tokens over SSE
 
 The next slice is improving post-rollover memory retrieval. Normal chat should remain a plain Gemma chat-template path inside the active window.
+
+## Verification
+
+Use Python 3.10+ for sidecar checks. This machine's plain `python` is Python 2.7, so local verification uses `python3` or `.venv/bin/python`.
+
+See `docs/verification.md` for syntax checks, streaming checks, chat-template verification, KV-cache reuse checks, and rollover verification.

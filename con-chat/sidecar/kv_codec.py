@@ -90,6 +90,14 @@ class TurboQuantStyleKVCodec(KVCodec):
             return []
         if torch.is_tensor(cache):
             return [cache]
+        if hasattr(cache, "layers"):
+            tensors: list[torch.Tensor] = []
+            for layer in getattr(cache, "layers", []):
+                for name in ("keys", "values", "key_cache", "value_cache"):
+                    tensor = getattr(layer, name, None)
+                    if torch.is_tensor(tensor) and tensor.numel():
+                        tensors.append(tensor)
+            return tensors
         if hasattr(cache, "to_legacy_cache"):
             cache = cache.to_legacy_cache()
         tensors: list[torch.Tensor] = []

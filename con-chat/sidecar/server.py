@@ -38,8 +38,10 @@ PRIMARY_MAX_NEW_TOKENS = int(os.environ.get("CON_CHAT_MAX_NEW_TOKENS", "1024"))
 KV_QUANTIZE_AFTER_TOKENS = int(os.environ.get("CON_CHAT_KV_QUANTIZE_AFTER_TOKENS", "4096"))
 KV_QUANTIZE_BITS = int(os.environ.get("CON_CHAT_KV_QUANTIZE_BITS", "4"))
 KV_QUANTIZE_RESIDUAL_LENGTH = int(os.environ.get("CON_CHAT_KV_QUANTIZE_RESIDUAL_LENGTH", "128"))
+KV_CODEC_ENABLED = os.environ.get("CON_CHAT_KV_CODEC_ENABLED", "1") not in {"0", "false", "False"}
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
+GEMMA4_CHAT_TEMPLATE_PATH = Path(__file__).resolve().parent / "chat_template_gemma4.jinja"
 DEFAULT_MEMORY_KIND = "summary+kv-int4"
 DEFAULT_REPLAY_LAYER = 34
 RETRIEVAL_LIMIT = 4
@@ -372,6 +374,7 @@ class GemmaRuntime:
             device, dtype = self._resolve_device()
             log_event(f"loading model={self.model_name} device={device} dtype={dtype}")
             tokenizer = AutoTokenizer.from_pretrained(self.model_name, local_files_only=True)
+            self._ensure_official_chat_template(tokenizer)
             model = AutoModelForCausalLM.from_pretrained(
                 self.model_name,
                 local_files_only=True,
@@ -403,6 +406,16 @@ class GemmaRuntime:
             log_event(f"model load failed error={self.error}")
         finally:
             self.load_seconds = time.perf_counter() - start
+
+    def _ensure_official_chat_template(self, tokenizer) -> None:
+        if getattr(tokenizer, "chat_template", None):
+            return
+        if not GEMMA4_CHAT_TEMPLATE_PATH.exists():
+            raise RuntimeError("missing_official_gemma4_chat_template")
+        tokenizer.chat_template = GEMMA4_CHAT_TEMPLATE_PATH.read_text()
+        log_event(
+            "loaded official Gemma chat template asset because local tokenizer snapshot has no chat_template"
+        )
 
     def count_tokens(self, text: str) -> int:
         if not self.tokenizer:
@@ -503,6 +516,10 @@ class GemmaRuntime:
         turn_messages = self._messages_from_turns(turns)
         full_messages = [*turn_messages, {"role": "user", "content": user_text}]
         full_prompt = self._render_chat_prompt(full_messages, add_generation_prompt=True)
+        log_event(
+            f"official chat template prompt preview={self._redacted_prompt_preview(full_prompt)}",
+            request_id=request_id,
+        )
         if full_prompt.startswith(session.prompt_text):
             suffix = full_prompt[len(session.prompt_text) :]
             suffix_batch = self.tokenizer(
@@ -555,13 +572,12 @@ class GemmaRuntime:
 
         with self.lock, torch.inference_mode():
             for step in range(PRIMARY_MAX_NEW_TOKENS):
-                model_inputs = self.model.prepare_inputs_for_generation(
+                outputs = self.model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     past_key_values=current_cache,
                     use_cache=True,
                 )
-                outputs = self.model(**model_inputs)
                 current_cache = outputs.past_key_values
                 step_logits = outputs.logits[:, -1, :]
                 next_token_id = self._sample_next_token(step_logits)
@@ -654,6 +670,8 @@ class GemmaRuntime:
     def build_memory_payload(self, turns: list[sqlite3.Row]) -> tuple[bytes, dict[str, object]]:
         if not self.ready or not self.model or not self.tokenizer:
             return b"", {"codec": self.memory_kv_codec.name, "error": "model_not_ready"}
+        if not KV_CODEC_ENABLED:
+            return b"", {"codec": self.memory_kv_codec.name, "enabled": False}
         encoded = self._encode_chat_messages(
             self._messages_from_turns(turns),
             add_generation_prompt=False,
@@ -797,10 +815,38 @@ class GemmaRuntime:
             return
         if not official_prompt.startswith(session.prompt_text):
             log_event(
-                "session cache invalidated because visible assistant text differs from generated template boundary",
+                "session cache rebuilt at official template boundary after visible assistant normalization",
                 request_id=request_id,
             )
-            self.invalidate_session(session.conversation_id)
+            encoded = self.tokenizer(
+                official_prompt,
+                add_special_tokens=False,
+                return_tensors="pt",
+                return_attention_mask=True,
+            )
+            cache_kind = self._preferred_cache_kind(int(encoded.input_ids.shape[-1]))
+            cache = self._new_cache(cache_kind)
+            with self.lock, torch.inference_mode():
+                try:
+                    outputs = self.model(
+                        input_ids=encoded.input_ids.to(self.actual_device),
+                        attention_mask=encoded.attention_mask.to(self.actual_device),
+                        use_cache=True,
+                        past_key_values=cache,
+                    )
+                except Exception:
+                    self.quantized_cache_supported = False
+                    cache_kind = "dynamic"
+                    outputs = self.model(
+                        input_ids=encoded.input_ids.to(self.actual_device),
+                        attention_mask=encoded.attention_mask.to(self.actual_device),
+                        use_cache=True,
+                        past_key_values=DynamicCache(config=self.model.config),
+                    )
+            session.cache = outputs.past_key_values
+            session.cache_kind = cache_kind
+            session.prompt_text = official_prompt
+            session.token_ids = encoded.input_ids[0].tolist()
             return
         suffix = official_prompt[len(session.prompt_text) :]
         if not suffix:
@@ -819,13 +865,12 @@ class GemmaRuntime:
             device=self.actual_device,
         )
         with self.lock, torch.inference_mode():
-            model_inputs = self.model.prepare_inputs_for_generation(
+            outputs = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 past_key_values=session.cache,
                 use_cache=True,
             )
-            outputs = self.model(**model_inputs)
         session.cache = outputs.past_key_values
         session.prompt_text = official_prompt
         session.token_ids.extend(suffix_batch.input_ids[0].tolist())
@@ -842,6 +887,14 @@ class GemmaRuntime:
             elif role == "assistant":
                 messages.append({"role": "assistant", "content": text})
         return messages
+
+    def _redacted_prompt_preview(self, prompt: str, *, limit: int = 700) -> str:
+        preview = prompt[:limit]
+        preview = preview.replace(SYSTEM_PROMPT[:80], "[SYSTEM_PROMPT]")
+        preview = re.sub(r"\s+", " ", preview).strip()
+        if len(prompt) > limit:
+            preview += "..."
+        return repr(preview)
 
     def _render_chat_prompt(self, messages: list[dict[str, str]], *, add_generation_prompt: bool) -> str:
         rendered = self._apply_chat_template(
@@ -1428,7 +1481,7 @@ class Store:
             )
             return None, min(active_tokens, ACTIVE_WINDOW_MAX_TOKENS)
 
-        sealed_text = self._sealed_fallback_text(sealed_rows)
+        sealed_text = self._sealed_memory_text(sealed_rows)
         retrieval_key = self._retrieval_key(sealed_text)
         object_id = f"memory-{int(datetime.now().timestamp() * 1000)}"
         created_at = now_iso()
@@ -1554,7 +1607,7 @@ class Store:
             span.append(rows.pop(0))
         return span
 
-    def _sealed_fallback_text(self, rows: list[sqlite3.Row]) -> str:
+    def _sealed_memory_text(self, rows: list[sqlite3.Row]) -> str:
         parts = []
         for row in rows:
             role = "User" if row["role"] == "user" else "Assistant"
