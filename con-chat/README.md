@@ -1,13 +1,13 @@
 # con-chat
 
-`con-chat` is the product shell for the replay protocol in this repository: a local macOS chat app where the conversation feels continuous, while the live model state stays bounded.
+`con-chat` is a local macOS chat app where the user sees one lifetime conversation. Inside the active context window it behaves like normal Gemma chat: the sidecar passes a real system message plus normal user/assistant turns through the tokenizer's official chat template.
 
 ## Product Shape
 
 - macOS desktop app built with Electron
 - local Python inference sidecar for Gemma + replay logic
 - one continuous conversation from the user's point of view
-- bounded active context window that rolls older stabilized turns into memory objects
+- bounded active context window that rolls older stabilized turns into reconstructive memory objects only after the window boundary is reached
 - collapsible left rail that visualizes the conversation and memory graph as it grows
 
 ## Runtime Split
@@ -23,25 +23,23 @@ The app should not run the model stack inside Node.
   - Gemma loading
   - MPS execution
   - tokenization
-  - replay-object creation
-  - retrieval / routing
+- post-boundary memory-object creation
+- future retrieval / routing
   - ledger updates
 
 That split keeps the product shell stable while reusing the existing replay work instead of rewriting it into JavaScript.
 
 ## Context Protocol
 
-The target protocol is:
-
-`live_state + recalled_state + current_input -> next_state`
-
 For the v1 app:
 
 - the user stays in one visible thread
-- the active thread grows turn-by-turn until it approaches `32k` tokens
-- older stabilized regions are compacted into memory objects
-- the default compact object is replay-token `fp16`
-- richer replay or text fallback is used only when necessary
+- the active thread grows turn-by-turn until it exceeds the `32k` active window
+- below that boundary, no residual memory is injected and no memory objects are created
+- older stable regions are compacted after rollover into reconstructive memory objects
+- v1 memory stores summary text, anchors, token accounting, and an optional TurboQuant-style compressed KV payload
+- residual/replay memory is a future advanced memory-object type, not required for normal chat
+- there is no retry-based exact-answer validation
 
 ## Packaging
 
@@ -69,6 +67,6 @@ The scaffold is intentionally thin but already executable as a product boundary:
 - the renderer bootstraps from that persisted state instead of hardcoded demo messages
 - one real end-to-end chat turn now flows:
   - renderer -> Electron main -> Python sidecar -> SQLite -> Electron main -> renderer
-- the sidecar now loads Gemma once, keeps it resident, and serves real local generation instead of a deterministic stub
+- the sidecar loads Gemma once, keeps it resident, assembles prompts with `tokenizer.apply_chat_template`, uses KV cache for active-session continuity, and streams real tokens over SSE
 
-The next slice is bounded active-window assembly: keep Gemma generation on the current thread, then start sealing older stable ranges into replay objects at the `32k` boundary.
+The next slice is improving post-rollover memory retrieval. Normal chat should remain a plain Gemma chat-template path inside the active window.

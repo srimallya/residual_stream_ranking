@@ -9,6 +9,10 @@ __pycache__/
 build/
 dist/
 .playwright-cli/
+*.sqlite3
+con-chat.sqlite3
+con-chat/state/
+con-chat/logs/
 
 # Keep local model weights and caches out of Git.
 models/

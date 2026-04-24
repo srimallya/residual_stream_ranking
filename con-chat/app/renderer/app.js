@@ -28,25 +28,6 @@ function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => window.setTimeout(resolve, ms));
-}
-
-function normalizeMessageText(text) {
-  return String(text || "").replace(/\s+/g, " ").trim();
-}
-
-function findLastUserMessageIndex(messages, text) {
-  const normalized = normalizeMessageText(text);
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (message.role === "user" && normalizeMessageText(message.text) === normalized) {
-      return index;
-    }
-  }
-  return -1;
-}
-
 function createHttpBridge(baseUrl = "http://127.0.0.1:4318") {
   return {
     async healthState() {
@@ -559,28 +540,6 @@ function applyBootstrap(initial) {
   drawGraph();
 }
 
-async function recoverAfterSendFailure(userText, sawStreamData) {
-  const deadline = Date.now() + 8000;
-  while (Date.now() < deadline) {
-    try {
-      const snapshot = await bridge.bootstrapState();
-      const lastUserIndex = findLastUserMessageIndex(snapshot.messages, userText);
-      if (lastUserIndex !== -1) {
-        const hasAssistantAfter = snapshot.messages
-          .slice(lastUserIndex + 1)
-          .some((message) => message.role === "assistant");
-        if (hasAssistantAfter || sawStreamData) {
-          return snapshot;
-        }
-      }
-    } catch (_error) {
-      // Sidecar is still unavailable; keep waiting.
-    }
-    await sleep(700);
-  }
-  return null;
-}
-
 async function syncSidecarStatus({ resync = false } = {}) {
   try {
     const health = await bridge.healthState();
@@ -654,12 +613,12 @@ function bindComposer() {
       pending: true
     };
     const pendingAssistant = {
-      id: `thinking-${Date.now()}`,
+      id: `assistant-${Date.now()}`,
       role: "assistant",
       roleLabel: "con-chat",
       text: "",
       pending: true,
-      thinking: true,
+      thinking: false,
       thinkingLabel: "thinking",
       thinkingText: ""
     };
@@ -670,11 +629,9 @@ function bindComposer() {
     input.style.height = "42px";
 
     let result;
-    let sawStreamData = false;
     try {
       result = await bridge.sendMessageStream(text, state.currentTokens, {
         onToken(payload) {
-          sawStreamData = sawStreamData || Boolean(payload.delta || payload.thinkingDelta);
           state.messages = state.messages.map((message) => {
             if (message.id !== pendingAssistant.id) {
               return message;
@@ -691,13 +648,6 @@ function bindComposer() {
         }
       });
     } catch (_error) {
-      setStatusBadge("restarting", "sidecar");
-      const recoveredSnapshot = await recoverAfterSendFailure(text, sawStreamData);
-      if (recoveredSnapshot) {
-        state.sending = false;
-        applyBootstrap(recoveredSnapshot);
-        return;
-      }
       state.messages = state.messages.map((message) => {
         if (message.id === pendingMessage.id) {
           return { ...message, pending: false, failed: true };

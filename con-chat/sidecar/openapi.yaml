@@ -2,7 +2,7 @@ openapi: 3.1.0
 info:
   title: con-chat sidecar
   version: 0.1.0
-  description: Local inference sidecar contract for Gemma chat, replay memory, and lifecycle reporting.
+  description: Local inference sidecar contract for normal Gemma chat, post-rollover reconstructive memory, and lifecycle reporting.
 servers:
   - url: http://127.0.0.1:4318
 paths:
@@ -14,7 +14,7 @@ paths:
           description: Healthy
   /v1/chat/respond:
     post:
-      summary: Generate the next assistant turn from bounded active state plus recalled memory.
+      summary: Generate the next assistant turn from the active window using the model tokenizer's official chat template.
       requestBody:
         required: true
         content:
@@ -42,7 +42,7 @@ paths:
           description: Conversation graph snapshot
   /v1/memory/compact:
     post:
-      summary: Seal an older conversation region into a replayable memory object.
+      summary: Seal an older conversation region into a reconstructive memory object after active-window rollover.
       requestBody:
         required: true
         content:
@@ -131,7 +131,7 @@ components:
               type: string
         replayKind:
           type: string
-          enum: [token-fp16, token-exact, band-full, text-fallback]
+          enum: [summary-kv-int4]
     RetrieveRequest:
       type: object
       required:

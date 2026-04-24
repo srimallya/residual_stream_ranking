@@ -4,7 +4,8 @@
 
 - Ship a local macOS chat app with a bundled Gemma model.
 - Keep the user's conversation visually continuous.
-- Prevent unbounded KV-cache growth by sealing older context into replayable memory objects.
+- Behave like normal Gemma chat inside the active context window by using the tokenizer's official chat template.
+- Prevent unbounded KV-cache growth by sealing older context into reconstructive memory objects after rollover.
 - Make memory visible through a graph in the collapsible left rail.
 
 ## Core Components
@@ -36,9 +37,10 @@ Owns:
 
 - Gemma model residency
 - MPS model execution
-- active-window assembly
-- replay object creation
-- retrieval/routing
+- official chat-template active-window assembly
+- KV cache reuse for normal in-window session continuity
+- post-boundary memory object creation
+- future retrieval/routing
 - memory ledger updates
 
 Current implemented slice:
@@ -52,18 +54,18 @@ Current implemented slice:
   - ledger events
   - settings
 - real end-to-end chat round-trip through Electron -> sidecar -> SQLite -> renderer
-- resident Gemma generation inside the sidecar, with health and timing surfaced separately from orchestration
+- resident Gemma generation inside the sidecar, with SSE token streaming, health, and timing surfaced separately from orchestration
 
 ## Active Conversation Policy
 
-- Active window target: `32k` tokens
+- Active window maximum: `32k` tokens
+- Rollover target after crossing the boundary: about `30k` tokens
 - The user experiences one visible thread
-- Older stable ranges are sealed into memory objects
-- Default memory object: replay-token `fp16`
-- Escalation path:
-  - exact replay token
-  - richer local replay band
-  - text fallback
+- Until the active window crosses the maximum, the sidecar does not create memory objects or inject residual memory
+- Older stable ranges are sealed into reconstructive memory objects only after rollover
+- Default v1 memory object: summary text, entity/topic anchors, token accounting, and optional TurboQuant-style grouped-int4 KV payload
+- Residual/replay memory is an advanced future memory-object type, not a requirement for normal chat
+- The system does not run retry-based exact-answer validation; memory is reconstructive and moves forward
 
 ## Memory Graph
 
