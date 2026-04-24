@@ -167,6 +167,9 @@ Internal reasoning policy:
 - Do not dump the full internal workspace by default.
 - By default, answer naturally and directly.
 - If the user asks for symbolic reasoning, then provide a compact visible version of the workspace.
+- For ordinary knowledge questions, answer in normal prose.
+- Do not expose BOUNDARY, RELATION, ENTITY, OBSERVED, INFERRED, HYPOTHESIZED, UNKNOWN, or provisional-symbol scaffolding unless the user explicitly asks to see symbolic reasoning.
+- Do not label hidden analysis as "Thinking Process" in the visible answer.
 
 Visible reasoning mode:
 If the user explicitly asks to see the symbolic reasoning, use this compact format:
@@ -243,9 +246,11 @@ Reasoning rules for user interaction:
 - Be direct.
 - Use plain language.
 - Avoid unnecessary jargon.
-- Do not expose symbolic machinery unless it helps.
+- Do not expose symbolic machinery unless the user explicitly asks for it.
 - If the user is thinking at a high level, preserve the conceptual structure.
 - If the user asks for implementation, turn symbols into concrete modules, steps, or pseudocode.
+- For ordinary factual questions, answer in English unless the user asks for another language.
+- Prefer a short direct answer over a taxonomy. Use one or two paragraphs and only a few bullets when helpful.
 
 Tool and evidence policy:
 - If tools, documents, or search are available, use them when needed to test uncertain hypotheses or retrieve missing evidence.
@@ -259,9 +264,12 @@ By default:
 - keep it concise
 - mention uncertainty where needed
 - use symbolic reasoning silently
+- never start a normal answer with symbolic scaffolding
+- never show internal BOUNDARY/RELATION/ENTITY blocks for ordinary questions
+- do not preface answers with multilingual labels or transliterations unless the user asks for them
 
 When the problem is complex:
-- you may briefly expose a small symbolic scaffold if it improves clarity
+- you may briefly expose a small symbolic scaffold only if the user asks for symbolic reasoning or formalization
 
 When the user asks for formalization:
 - present the symbols, relations, assumptions, and constraints explicitly
@@ -953,10 +961,14 @@ class GemmaRuntime:
                 thinking = (match.groupdict().get("thinking") or "").strip()
                 content = (match.groupdict().get("content") or "").strip()
         answer = self._clean_response(content)
+        leaked_thinking, answer = self._separate_symbolic_scaffold(answer)
+        if leaked_thinking:
+            thinking = "\n\n".join(part for part in (thinking, leaked_thinking) if part)
         return thinking, answer
 
     def _clean_response(self, text: str) -> str:
         cleaned = text.strip()
+        cleaned = re.sub(r"^[^A-Za-z\n]{1,60}\s+(?=(?:\([A-Za-z]|[A-Za-z]))", "", cleaned)
         cleaned = re.sub(r"<end[_ ]of[_ ]turn>", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"<start[_ ]of[_ ]turn>\s*(model|assistant)", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"<mid[_-]of[_-]turn[^>\n]*>", "", cleaned, flags=re.IGNORECASE)
@@ -971,6 +983,65 @@ class GemmaRuntime:
         cleaned = cleaned.replace("\nAssistant:", "\n").strip()
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
         return cleaned
+
+    def _separate_symbolic_scaffold(self, text: str) -> tuple[str, str]:
+        cleaned = text.strip()
+        if not cleaned:
+            return "", ""
+
+        answer_match = re.search(
+            r"(?im)^\s*(?:#+\s*)?(?:ANSWER|FINAL ANSWER)\s*:?\s*$",
+            cleaned,
+        )
+        if answer_match:
+            scaffold = cleaned[: answer_match.start()].strip()
+            answer = cleaned[answer_match.end() :].strip()
+            return scaffold, answer
+
+        marker_pattern = re.compile(
+            r"(?im)^\s*(?:"
+            r"thinking process|"
+            r"boundaries?|"
+            r"relations?|"
+            r"observed|"
+            r"inferred|"
+            r"hypothesized|"
+            r"unknown|"
+            r"entity\s*:|"
+            r"relation\s*:|"
+            r"state/concept\s*:|"
+            r"state\s*:|"
+            r"concept\s*:"
+            r")"
+        )
+        first_marker = marker_pattern.search(cleaned)
+        if not first_marker:
+            return "", cleaned
+
+        prose_starts = [
+            match.start()
+            for match in re.finditer(
+                r"(?im)^\s*(?:"
+                r"The\s+|"
+                r"Hormuz\s+|"
+                r"The Strait\s+|"
+                r"In short\b|"
+                r"Put simply\b|"
+                r"Short answer\b|"
+                r"Here(?:'s| is)\b"
+                r")",
+                cleaned,
+            )
+            if match.start() > first_marker.start()
+        ]
+        if prose_starts:
+            split_at = min(prose_starts)
+            return cleaned[:split_at].strip(), cleaned[split_at:].strip()
+
+        # If the model only produced scaffold so far, keep it out of the visible answer.
+        if first_marker.start() < 80:
+            return cleaned, ""
+        return "", cleaned
 
     def _is_preview_artifact(self, text: str) -> bool:
         return text.startswith("Browser preview mode is active")

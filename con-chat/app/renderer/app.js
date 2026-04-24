@@ -20,8 +20,13 @@ let healthMonitorHandle = 0;
 const PLACEHOLDER_CONVERSATION_IDS = new Set(["offline", "loading", "restarting", "connecting"]);
 
 function setStatusBadge(status, detail = "") {
-  void status;
-  void detail;
+  const pill = byId("status-pill");
+  if (!pill) {
+    return;
+  }
+  const normalized = String(status || "unknown").toUpperCase();
+  const suffix = detail ? ` · ${String(detail).toUpperCase()}` : "";
+  pill.textContent = `${normalized}${suffix}`;
 }
 
 function clamp(value, min, max) {
@@ -412,6 +417,37 @@ function renderMarkdown(text) {
   return blocks.join("");
 }
 
+function renderThinkingDisclosure(text) {
+  const details = document.createElement("details");
+  details.className = "thinking-wrap";
+
+  const summary = document.createElement("summary");
+  summary.textContent = "thinking";
+  details.appendChild(summary);
+
+  const body = document.createElement("div");
+  body.className = "thinking-body";
+  body.textContent = text;
+  details.appendChild(body);
+
+  return details;
+}
+
+function renderCopyButton(text) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "copy-button";
+  button.textContent = "Copy";
+  button.addEventListener("click", async () => {
+    const copied = await copyText(text);
+    button.textContent = copied ? "Copied" : "Copy";
+    window.setTimeout(() => {
+      button.textContent = "Copy";
+    }, 1100);
+  });
+  return button;
+}
+
 function applyGraphTransform(group) {
   group.setAttribute(
     "transform",
@@ -499,22 +535,23 @@ function renderMessages(messages) {
     article.className = `message ${message.role}${message.pending ? " pending" : ""}`;
     const hasThinking = Boolean(message.thinking || (message.thinkingText && message.thinkingText.trim()));
 
+    const role = document.createElement("div");
+    role.className = "message-role";
+    role.textContent = message.role === "user" ? "You" : "con-chat";
+
     const body = document.createElement("div");
     body.className = "message-body";
     body.innerHTML = renderMarkdown(message.text);
 
-    if (hasThinking) {
-      const thinkingText = document.createElement("div");
-      thinkingText.className = "message-thinking";
-      if (message.thinkingText) {
-        thinkingText.textContent = message.thinkingText;
-      }
-      article.appendChild(thinkingText);
-      if (message.text) {
-        article.appendChild(body);
-      }
-    } else {
+    article.appendChild(role);
+    if (hasThinking && message.thinkingText) {
+      article.appendChild(renderThinkingDisclosure(message.thinkingText));
+    }
+    if (message.text || !hasThinking) {
       article.appendChild(body);
+    }
+    if (message.role === "assistant" && message.text && !message.pending) {
+      article.appendChild(renderCopyButton(message.text));
     }
     thread.appendChild(article);
     });
